@@ -1,0 +1,458 @@
+"""Шлюз приватного сервиса Дня 30 (spec FR-01…FR-17, plan D-01…D-18).
+
+Порядок проверок у каждого запроса: подсеть клиента → ключ и права → лимит
+ключа (ручки /v1/*) → размер тела и входа в токенах (до вызова модели) →
+очередь (одна генерация за раз, ждут ≤ N). Всё, что не прошло, — ошибка в
+формате OpenAI, текст по-русски. Модель — одна (`loc-rag-docs`); в Ollama
+шлюз ходит так же, как агент: /api/chat, think: false, keep_alive, окно и предел.
+
+  Сервис(настройки, ключи, журнал, токенизатор, ollama, …) — состояние
+  создать_приложение(сервис) -> FastAPI
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+from typing import Any, AsyncIterator, Callable
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+
+from agent.service.config import КОРЕНЬ, Настройки
+from agent.service.journal import Журнал
+from agent.service.keys import Ключи
+from agent.service.limits import Ведро, Очередь, ОчередьПолна, Подсети
+from agent.service.tokens import Токенизатор
+
+РОЛИ = ("system", "user", "assistant")
+
+
+class КлиентУшёл(Exception):
+    pass
+
+
+def ошибка(код: int, сообщение: str, тип: str, code: str, заголовки: dict[str, str] | None = None) -> JSONResponse:
+    return JSONResponse({"error": {"message": сообщение, "type": тип, "code": code}}, status_code=код,
+                        headers=заголовки or {})
+
+
+def _текст(содержимое: Any) -> str | None:
+    """content OpenAI: строка или список частей {"type": "text", "text": …}."""
+    if isinstance(содержимое, str):
+        return содержимое
+    if isinstance(содержимое, list):
+        части = [ч.get("text", "") for ч in содержимое if isinstance(ч, dict) and ч.get("type") == "text"]
+        return "".join(части) if len(части) == len(содержимое) else None
+    return None
+
+
+class Сервис:
+    """Состояние шлюза: настройки, ключи, лимиты, очередь, журнал и клиенты.
+
+    ollama — httpx.AsyncClient с base_url Ollama (в тестах — с MockTransport);
+    отвечатель — фабрика ответа по документам (в тестах — подставная)."""
+
+    def __init__(self, настройки: Настройки, ключи: Ключи, журнал: Журнал, токенизатор: Токенизатор,
+                 ollama: httpx.AsyncClient, отвечатель: Callable[[str], dict[str, Any]] | None = None,
+                 состояние: Callable[[], dict[str, Any]] | None = None,
+                 шаг: Callable[[str, str], dict[str, Any]] | None = None,
+                 нагрузка: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> None:
+        self.настройки = настройки
+        self.ключи = ключи
+        self.журнал = журнал
+        self.токенизатор = токенизатор
+        self.ollama = ollama
+        self.подсети = Подсети(настройки.подсети)
+        л = настройки.лимиты
+        self.ведро = Ведро(л.запросов_в_минуту)
+        self.очередь = Очередь(л.очередь)
+        self.отвечатель = отвечатель
+        self.доп_состояние = состояние
+        self.шаг = шаг
+        self.нагрузка = нагрузка
+
+    # --- ключи и лимит ---------------------------------------------------------------
+
+    def ключ(self, request: Request, право: str | None) -> dict[str, Any] | JSONResponse:
+        заголовок = request.headers.get("authorization", "")
+        if not заголовок.lower().startswith("bearer "):
+            request.state.журнал["ошибка"] = "missing_api_key"
+            return ошибка(401, "Нужен ключ API: заголовок Authorization: Bearer sk-day30-…", "authentication_error",
+                          "missing_api_key", {"WWW-Authenticate": "Bearer"})
+        запись = self.ключи.проверить(заголовок[7:].strip())
+        if запись is None:
+            request.state.журнал["ошибка"] = "invalid_api_key"
+            return ошибка(401, "Ключ API неизвестен или отозван.", "authentication_error", "invalid_api_key",
+                          {"WWW-Authenticate": "Bearer"})
+        request.state.ключ = запись["имя"]
+        if право and право not in запись["права"]:
+            request.state.журнал["ошибка"] = "permission_denied"
+            return ошибка(403, f"У ключа «{запись['имя']}» нет права «{право}».", "permission_error",
+                          "permission_denied")
+        return запись
+
+    def лимит(self, request: Request, запись: dict[str, Any]) -> JSONResponse | None:
+        ок, ждать = self.ведро.взять(запись["имя"])
+        if ок:
+            return None
+        request.state.журнал["ошибка"] = "rate_limited"
+        секунд = max(1, int(ждать + 0.999))
+        в_минуту = self.настройки.лимиты.запросов_в_минуту
+        return ошибка(429, f"Лимит ключа «{запись['имя']}» — {в_минуту} запросов в минуту. Повторите через {секунд} с.",
+                      "rate_limit_error", "rate_limited",
+                      {"Retry-After": str(секунд), "X-RateLimit-Limit": str(в_минуту), "X-RateLimit-Remaining": "0"})
+
+    def полна(self, засчитать: bool = True) -> JSONResponse:
+        """429 queue_full. засчитать=False — отказ уже посчитала сама очередь (гонка за место)."""
+        if засчитать:
+            self.очередь.отказано += 1
+        с = self.очередь.состояние()
+        повтор = self.очередь.повтор_через()
+        return ошибка(429, f"Очередь полна: идёт генерация и ждут {с['ждут']} из {с['мест_в_очереди']}. "
+                           f"Повторите через {повтор} с.", "rate_limit_error", "queue_full",
+                      {"Retry-After": str(повтор)})
+
+    # --- Ollama ----------------------------------------------------------------------
+
+    def тело_ollama(self, сообщения: list[dict[str, str]], предел: int, температура: float, поток: bool) -> dict:
+        н = self.настройки
+        return {"model": н.модель, "messages": сообщения, "stream": поток, "think": False, "keep_alive": н.keep_alive,
+                "options": {"num_ctx": н.лимиты.окно, "num_predict": предел, "temperature": температура}}
+
+    async def прогреть(self) -> None:
+        """Модель — в память до первого запроса: живой сервис не платит загрузку на посетителе."""
+        try:
+            await self.ollama.post("/api/chat", json={"model": self.настройки.модель, "messages": [],
+                                                      "keep_alive": self.настройки.keep_alive}, timeout=300)
+        except httpx.HTTPError:
+            pass
+
+    async def с_обрывом(self, request: Request, работа: Any) -> Any:
+        """Ждать работу, пока клиент на связи; ушёл — работа отменяется (очередь освобождается)."""
+        задача = asyncio.ensure_future(работа)
+        try:
+            while True:
+                готово, _ = await asyncio.wait({задача}, timeout=0.5)
+                if готово:
+                    return задача.result()
+                if await request.is_disconnected():
+                    задача.cancel()
+                    raise КлиентУшёл()
+        except asyncio.CancelledError:
+            задача.cancel()
+            raise
+
+
+def создать_приложение(с: Сервис) -> FastAPI:
+    app = FastAPI(title="День 30 — приватный AI-сервис", docs_url=None, redoc_url=None,
+                  description="OpenAI-совместимый шлюз перед локальной Ollama (loc-rag-docs).")
+    л = с.настройки.лимиты
+
+    @app.middleware("http")
+    async def сеть_и_размер(request: Request, следующий):
+        адрес = request.client.host if request.client else ""
+        начало = time.monotonic()
+        if not с.подсети.разрешён(адрес):
+            с.журнал.записать(адрес=адрес, ручка=request.url.path, код=403, ошибка="forbidden_network")
+            return ошибка(403, f"Адрес {адрес} не входит в разрешённые подсети сервиса.", "permission_error",
+                          "forbidden_network")
+        размер = request.headers.get("content-length")
+        if размер and размер.isdigit() and int(размер) > л.тело_байт:
+            с.журнал.записать(адрес=адрес, ручка=request.url.path, код=413, ошибка="request_too_large")
+            return ошибка(413, f"Тело запроса {int(размер)} байт больше предела {л.тело_байт}.",
+                          "invalid_request_error", "request_too_large")
+        request.state.ключ = ""
+        request.state.журнал = {}
+        ответ = await следующий(request)
+        if not request.url.path.startswith(("/admin/api/state", "/health")) and not request.state.журнал.get("поток"):
+            с.журнал.записать(адрес=адрес, ключ=request.state.ключ, ручка=request.url.path, код=ответ.status_code,
+                              длительность_с=round(time.monotonic() - начало, 2), **request.state.журнал)
+        return ответ
+
+    # --- открытые ---------------------------------------------------------------------
+
+    @app.get("/health")
+    async def здоровье() -> dict[str, Any]:
+        return {"status": "ok", "model": с.настройки.модель, "queue": с.очередь.состояние(),
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+    @app.get("/chat", response_class=HTMLResponse)
+    async def чат_страница() -> HTMLResponse:
+        return HTMLResponse(Path(КОРЕНЬ, "templates", "service_chat.html").read_text(encoding="utf-8"))
+
+    @app.get("/admin", response_class=HTMLResponse)
+    async def админ_страница() -> HTMLResponse:
+        return HTMLResponse(Path(КОРЕНЬ, "templates", "service_admin.html").read_text(encoding="utf-8"))
+
+    # --- /v1 ------------------------------------------------------------------------------
+
+    @app.get("/v1/models")
+    async def модели(request: Request):
+        запись = с.ключ(request, None)
+        if isinstance(запись, JSONResponse):
+            return запись
+        if (отказ := с.лимит(request, запись)) is not None:
+            return отказ
+        return {"object": "list", "data": [{"id": с.настройки.модель, "object": "model", "created": 0,
+                                             "owned_by": "day30-private"}]}
+
+    @app.post("/v1/chat/completions")
+    async def чат(request: Request):
+        запись = с.ключ(request, "чат")
+        if isinstance(запись, JSONResponse):
+            return запись
+        if (отказ := с.лимит(request, запись)) is not None:
+            return отказ
+        try:
+            тело = await request.json()
+        except ValueError:
+            return ошибка(400, "Тело запроса — не JSON.", "invalid_request_error", "invalid_json")
+        модель = тело.get("model") or с.настройки.модель
+        if модель != с.настройки.модель:
+            return ошибка(404, f"Модели «{модель}» нет. Есть одна: {с.настройки.модель}.", "invalid_request_error",
+                          "model_not_found")
+        сообщения = []
+        for м in тело.get("messages") or []:
+            текст = _текст(м.get("content")) if isinstance(м, dict) else None
+            if not isinstance(м, dict) or м.get("role") not in РОЛИ or текст is None:
+                return ошибка(400, "messages — список {role: system|user|assistant, content: текст}.",
+                              "invalid_request_error", "invalid_messages")
+            сообщения.append({"role": м["role"], "content": текст})
+        if not сообщения:
+            return ошибка(400, "Пустой список messages.", "invalid_request_error", "invalid_messages")
+        вход = await asyncio.to_thread(с.токенизатор.вход, сообщения)
+        request.state.журнал["вход"] = вход
+        if вход > л.вход_токенов:
+            request.state.журнал["ошибка"] = "context_length_exceeded"
+            return ошибка(413, f"Вход {вход} токенов больше предела {л.вход_токенов} (окно {л.окно} − ответ "
+                               f"{л.ответ_токенов} − запас). Сократите историю или текст.",
+                          "invalid_request_error", "context_length_exceeded",
+                          {"X-Prompt-Tokens": str(вход), "X-Prompt-Tokens-Limit": str(л.вход_токенов)})
+        просили = тело.get("max_tokens") or тело.get("max_completion_tokens") or л.ответ_токенов
+        try:
+            просили = int(просили)
+        except (TypeError, ValueError):
+            return ошибка(400, "max_tokens — целое число.", "invalid_request_error", "invalid_max_tokens")
+        предел = max(1, min(просили, л.ответ_токенов))
+        заголовки = {"X-Prompt-Tokens": str(вход)}
+        if просили > л.ответ_токенов:
+            заголовки["X-Max-Tokens-Clamped"] = f"{просили}->{л.ответ_токенов}"
+        try:
+            температура = min(2.0, max(0.0, float(тело.get("temperature", 0))))
+        except (TypeError, ValueError):
+            температура = 0.0
+        позиция = с.очередь.позиция()
+        try:
+            заявка = с.очередь.записаться()          # место — сразу, до любого await (гонка при всплеске)
+        except ОчередьПолна:
+            request.state.журнал["ошибка"] = "queue_full"
+            return с.полна(засчитать=False)
+        заголовки["X-Queue-Position"] = str(позиция)
+        тело_ollama = с.тело_ollama(сообщения, предел, температура, bool(тело.get("stream")))
+        if тело.get("stream"):
+            request.state.журнал["поток"] = True
+            взята = {"да": False}
+
+            def сторож() -> None:
+                # Поток так и не начался (клиент ушёл до первого байта) — место не держится.
+                if not взята["да"]:
+                    с.очередь.отменить(заявка)
+            asyncio.get_running_loop().call_later(30, сторож)
+            return StreamingResponse(_поток(request, тело_ollama, позиция, вход, запись["имя"], заявка, взята),
+                                     media_type="text/event-stream", headers=заголовки)
+        try:
+            ожидание = await с.с_обрывом(request, с.очередь.дождаться(заявка))
+        except КлиентУшёл:
+            request.state.журнал["ошибка"] = "client_gone"
+            return Response(status_code=499)
+        начало = time.monotonic()
+        try:
+            ответ = await с.с_обрывом(request, asyncio.wait_for(
+                с.ollama.post("/api/chat", json=тело_ollama, timeout=л.таймаут_с + 10), л.таймаут_с))
+            ответ.raise_for_status()
+            д = ответ.json()
+        except КлиентУшёл:
+            request.state.журнал["ошибка"] = "client_gone"
+            return Response(status_code=499)
+        except asyncio.TimeoutError:
+            request.state.журнал["ошибка"] = "timeout"
+            return ошибка(504, f"Генерация дольше {int(л.таймаут_с)} с.", "server_error", "timeout")
+        except httpx.HTTPError as exc:
+            request.state.журнал["ошибка"] = "ollama_error"
+            return ошибка(502, f"Ollama не ответила: {exc}", "server_error", "upstream_error")
+        finally:
+            с.очередь.выйти(time.monotonic() - начало)
+        заголовки["X-Queue-Wait"] = f"{ожидание:.1f}"
+        причина = "length" if д.get("done_reason") == "length" else "stop"
+        request.state.журнал.update({"ожидание_с": round(ожидание, 2), "ответ": д.get("eval_count"),
+                                     "причина": причина, "очередь": позиция})
+        вход_ollama, выход = д.get("prompt_eval_count") or 0, д.get("eval_count") or 0
+        return JSONResponse({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}", "object": "chat.completion", "created": int(time.time()),
+            "model": с.настройки.модель,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": (д.get("message") or {}).get("content", "")},
+                         "finish_reason": причина}],
+            "usage": {"prompt_tokens": вход_ollama, "completion_tokens": выход, "total_tokens": вход_ollama + выход},
+        }, headers=заголовки)
+
+    async def _поток(request: Request, тело_ollama: dict, позиция: int, вход: int, ключ: str,
+                     заявка: asyncio.Future, взята: dict) -> AsyncIterator[str]:
+        """SSE в формате OpenAI. Пока ждём очередь — комментарии «: очередь N» (клиенты их пропускают)."""
+        ид, создан = f"chatcmpl-{uuid.uuid4().hex[:24]}", int(time.time())
+        адрес = request.client.host if request.client else ""
+        кусок = lambda delta, причина=None, **ещё: "data: " + json.dumps(
+            {"id": ид, "object": "chat.completion.chunk", "created": создан, "model": с.настройки.модель,
+             "choices": [{"index": 0, "delta": delta, "finish_reason": причина}], **ещё}, ensure_ascii=False) + "\n\n"
+        запись = {"адрес": адрес, "ключ": ключ, "ручка": "/v1/chat/completions", "поток": True, "вход": вход,
+                  "очередь": позиция}
+        взята["да"] = True
+        yield f": очередь {позиция}\n\n"
+        вход_в_очередь = asyncio.ensure_future(с.очередь.дождаться(заявка))
+        начало = time.monotonic()
+        код, ошибка_кода, ожидание, выход, причина = 200, None, 0.0, None, None
+        try:
+            while True:
+                готово, _ = await asyncio.wait({вход_в_очередь}, timeout=2.0)
+                if готово:
+                    break
+                yield f": ждём, впереди {max(0, с.очередь.позиция() - 1)}\n\n"
+            ожидание = вход_в_очередь.result()
+            генерация = time.monotonic()
+            try:
+                первый = True
+                async with с.ollama.stream("POST", "/api/chat", json=тело_ollama,
+                                           timeout=с.настройки.лимиты.таймаут_с + 10) as r:
+                    r.raise_for_status()
+                    async for строка in r.aiter_lines():
+                        if not строка.strip():
+                            continue
+                        ч = json.loads(строка)
+                        if ч.get("done"):
+                            причина = "length" if ч.get("done_reason") == "length" else "stop"
+                            вход_о, выход = ч.get("prompt_eval_count") or 0, ч.get("eval_count") or 0
+                            yield кусок({}, причина, usage={"prompt_tokens": вход_о, "completion_tokens": выход,
+                                                             "total_tokens": вход_о + выход},
+                                        x_queue_wait=round(ожидание, 1))
+                            break
+                        текст = (ч.get("message") or {}).get("content", "")
+                        if первый:
+                            yield кусок({"role": "assistant", "content": текст})
+                            первый = False
+                        elif текст:
+                            yield кусок({"content": текст})
+                        if time.monotonic() - генерация > с.настройки.лимиты.таймаут_с:
+                            код, ошибка_кода = 504, "timeout"
+                            yield "data: " + json.dumps({"error": {"message": "Генерация дольше предела.",
+                                                                   "type": "server_error", "code": "timeout"}}) + "\n\n"
+                            break
+                yield "data: [DONE]\n\n"
+            finally:
+                с.очередь.выйти(time.monotonic() - генерация)
+        except asyncio.CancelledError:
+            вход_в_очередь.cancel()
+            код, ошибка_кода = 499, "client_gone"
+            raise
+        except httpx.HTTPError as exc:
+            код, ошибка_кода = 502, "ollama_error"
+            yield "data: " + json.dumps({"error": {"message": f"Ollama не ответила: {exc}", "type": "server_error",
+                                                   "code": "upstream_error"}}, ensure_ascii=False) + "\n\n"
+        finally:
+            с.журнал.записать(**запись, код=код, ошибка=ошибка_кода, ожидание_с=round(ожидание, 2),
+                              длительность_с=round(time.monotonic() - начало, 2), ответ=выход, причина=причина)
+
+    @app.post("/v1/documents/answer")
+    async def документы(request: Request):
+        запись = с.ключ(request, "документы")
+        if isinstance(запись, JSONResponse):
+            return запись
+        if (отказ := с.лимит(request, запись)) is not None:
+            return отказ
+        try:
+            тело = await request.json()
+        except ValueError:
+            return ошибка(400, "Тело запроса — не JSON.", "invalid_request_error", "invalid_json")
+        вопрос = str(тело.get("question") or "").strip()
+        if not вопрос:
+            return ошибка(400, "Пустой question.", "invalid_request_error", "empty_question")
+        if len(вопрос) > л.вопрос_символов:
+            request.state.журнал["ошибка"] = "question_too_long"
+            return ошибка(413, f"Вопрос {len(вопрос)} символов больше предела {л.вопрос_символов}.",
+                          "invalid_request_error", "question_too_long")
+        if с.отвечатель is None:
+            return ошибка(503, "Ответ по документам на этом сервере выключен.", "server_error", "documents_disabled")
+        позиция = с.очередь.позиция()
+        try:
+            заявка = с.очередь.записаться()
+        except ОчередьПолна:
+            request.state.журнал["ошибка"] = "queue_full"
+            return с.полна(засчитать=False)
+        try:
+            ожидание = await с.с_обрывом(request, с.очередь.дождаться(заявка))
+        except КлиентУшёл:
+            request.state.журнал["ошибка"] = "client_gone"
+            return Response(status_code=499)
+        # Ответ по документам — синхронный код Дня 29 в отдельном потоке. Поток не прервать:
+        # место в очереди освобождается, когда он закончит, даже если клиент уже ушёл.
+        начало = time.monotonic()
+        задача = asyncio.ensure_future(asyncio.to_thread(с.отвечатель, вопрос))
+        задача.add_done_callback(lambda _: с.очередь.выйти(time.monotonic() - начало))
+        try:
+            итог = await с.с_обрывом(request, asyncio.wait_for(asyncio.shield(задача), л.таймаут_с))
+        except КлиентУшёл:
+            request.state.журнал["ошибка"] = "client_gone"
+            return Response(status_code=499)
+        except asyncio.TimeoutError:
+            request.state.журнал["ошибка"] = "timeout"
+            return ошибка(504, f"Ответ по документам дольше {int(л.таймаут_с)} с.", "server_error", "timeout")
+        except Exception as exc:  # noqa: BLE001 — ошибка отвечателя: клиенту — 502, а не обрыв
+            request.state.журнал["ошибка"] = "documents_error"
+            return ошибка(502, f"Ответ по документам не получился: {exc}", "server_error", "documents_error")
+        request.state.журнал.update({"ожидание_с": round(ожидание, 2), "очередь": позиция,
+                                     "вход": (итог.get("usage") or {}).get("prompt_tokens"),
+                                     "ответ": (итог.get("usage") or {}).get("completion_tokens")})
+        return JSONResponse({"object": "documents.answer", "model": с.настройки.модель, **итог},
+                            headers={"X-Queue-Wait": f"{ожидание:.1f}", "X-Queue-Position": str(позиция)})
+
+    # --- служебные (ключ «админ») -------------------------------------------------------
+
+    @app.get("/admin/api/state")
+    async def состояние(request: Request):
+        запись = с.ключ(request, "админ")
+        if isinstance(запись, JSONResponse):
+            return запись
+        н = с.настройки
+        итог = {"service": {"адрес": н.адрес, "порт": н.порт, "подсети": list(н.подсети), "модель": н.модель,
+                            "лимиты": н.лимиты.__dict__, "keep_alive": н.keep_alive},
+                "queue": с.очередь.состояние(), "keys": с.ключи.список(), "requests": с.журнал.последние(50),
+                "clients": с.журнал.клиенты()}
+        if с.доп_состояние is not None:
+            итог.update(await asyncio.to_thread(с.доп_состояние))
+        return итог
+
+    @app.post("/admin/api/step")
+    async def ступень(request: Request):
+        запись = с.ключ(request, "админ")
+        if isinstance(запись, JSONResponse):
+            return запись
+        тело = await request.json()
+        if с.шаг is None:
+            return {"ok": False}
+        return await asyncio.to_thread(с.шаг, str(тело.get("событие", "")), str(тело.get("ступень", "")))
+
+    @app.post("/admin/api/load")
+    async def нагрузка(request: Request):
+        запись = с.ключ(request, "админ")
+        if isinstance(запись, JSONResponse):
+            return запись
+        if с.нагрузка is None:
+            return ошибка(503, "Нагрузка с этой страницы недоступна.", "server_error", "load_disabled")
+        итог = await asyncio.to_thread(с.нагрузка, await request.json())
+        return JSONResponse(итог, status_code=409 if итог.get("error") else 200)
+
+    return app
