@@ -92,12 +92,14 @@ def собрать(порт: int | None = None):
                 "runner": ({"pid": pid, **(resources.показания(pid) or {})} if pid else None),
                 "load": {"идёт": manage.идёт_нагрузка(), "последний": прогоны[0] if прогоны else None,
                          "полный": полный},
+                "telegram": manage.состояние_бота(),
                 "pid": os.getpid()}
 
     ollama = httpx.AsyncClient(base_url=н.ollama, timeout=httpx.Timeout(н.лимиты.таймаут_с + 30, connect=10))
     с = gateway.Сервис(н, keys.Ключи(os.path.join(данные, "keys.json")),
                        journal.Журнал(os.path.join(данные, "requests.jsonl")), токенизатор, ollama,
-                       отвечатель=ответить, состояние=состояние, шаг=шаг, нагрузка=manage.нагрузка_фоном)
+                       отвечатель=ответить, состояние=состояние, шаг=шаг, нагрузка=manage.нагрузка_фоном,
+                       телеграм=manage.бот_служба)
     app = gateway.создать_приложение(с)
 
     async def прогрев() -> None:

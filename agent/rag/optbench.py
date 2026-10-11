@@ -52,6 +52,9 @@ from datetime import datetime
 from typing import Any, Callable
 
 from agent.rag import localbench
+from agent.service.pd import ФАЙЛ_ФАМИЛИЙ, фамилии  # noqa: F401 — имена Дня 29
+from agent.service.pd import ШАБЛОНЫ as _ШАБЛОНЫ_ПД  # noqa: F401
+from agent.service.pd import найти as без_пд
 from agent.rag.answer import ПОРОГ_КЭША_ПРОМПТА, ПРЕДЕЛ_ЦИТАТ, РОЛЬ_МОДЕЛИ, С_RAG, ЦИТАТЫ, ОтветRAG
 from agent.rag.evaluate import записать_атомарно
 
@@ -791,36 +794,9 @@ def модельфайл(база: str, опции: dict[str, Any], без_пр�
 
 # --- отбор вопросов без ПД для GPU (D-12) --------------------------------------------
 
-# Фамилии подписантов из настоящих документов в коде не хранятся: репозиторий публичный.
-# Список (по основе на строку) — локальный файл pd-names.txt в корне проекта (в .gitignore)
-# или путь из PD_NAMES. Без файла остаются общие признаки: отчество, инициалы, e-mail, телефон.
-ФАЙЛ_ФАМИЛИЙ = "pd-names.txt"
-
-
-def фамилии() -> tuple[str, ...]:
-    путь = os.environ.get("PD_NAMES") or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ФАЙЛ_ФАМИЛИЙ)
-    try:
-        with open(путь, encoding="utf-8") as f:
-            return tuple(с.strip() for с in f if с.strip() and not с.lstrip().startswith("#"))
-    except OSError:
-        return ()
-
-
-_ШАБЛОНЫ_ПД = (
-    ("отчество", re.compile(r"\b[А-ЯЁ][а-яё]+(?:ович|евич|ьич|овна|евна|ична|инична)\b")),
-    ("инициалы и фамилия", re.compile(r"\b[А-ЯЁ]\.\s?[А-ЯЁ]\.\s?[А-ЯЁ][а-яё]{2,}")),
-    ("фамилия и инициалы", re.compile(r"\b[А-ЯЁ][а-яё]{2,}\s[А-ЯЁ]\.\s?[А-ЯЁ]\.")),
-    ("e-mail", re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")),
-    ("телефон", re.compile(r"(?:\+7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}")),
-)
-
-
-def без_пд(текст: str) -> list[str]:
-    """Что похоже на персональные данные: названия шаблонов (сами совпадения не возвращаются)."""
-    ф = фамилии()
-    шаблоны = ((("фамилия из списка", re.compile("|".join(map(re.escape, ф)))),) if ф else ()) + _ШАБЛОНЫ_ПД
-    return [имя for имя, ш in шаблоны if ш.search(текст or "")]
+# Шаблоны ПД и список фамилий (локальный pd-names.txt) — в agent/service/pd.py: в Дне 30
+# ими же Telegram-бот маскирует ответы перед отправкой. Имена здесь — те же, что в Дне 29:
+# ФАЙЛ_ФАМИЛИЙ, фамилии(), _ШАБЛОНЫ_ПД, без_пд(текст).
 
 
 def отбор_для_gpu(отвечатель, вопросы_: list[dict]) -> list[dict[str, Any]]:

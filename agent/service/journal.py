@@ -21,9 +21,10 @@ from typing import Any
 
 
 class Журнал:
-    def __init__(self, путь: str, размер: int = РАЗМЕР) -> None:
+    def __init__(self, путь: str, размер: int = РАЗМЕР, поля: tuple[str, ...] = ПОЛЯ) -> None:
         self.путь = путь
         self.размер = размер
+        self.поля = поля             # белый список: поле не из него в журнал не попадает
         self._замок = threading.Lock()
         self._последние: deque[dict[str, Any]] = deque(maxlen=200)
         for з in self._хвост(200):
@@ -45,7 +46,7 @@ class Журнал:
 
     def записать(self, **поля: Any) -> dict[str, Any]:
         запись = {"время": time.strftime("%Y-%m-%dT%H:%M:%S")}
-        запись.update({к: в for к, в in поля.items() if к in ПОЛЯ and в is not None})
+        запись.update({к: в for к, в in поля.items() if к in self.поля and в is not None})
         with self._замок:
             os.makedirs(os.path.dirname(self.путь) or ".", exist_ok=True)
             if os.path.exists(self.путь) and os.path.getsize(self.путь) > self.размер:

@@ -62,7 +62,8 @@ class Сервис:
                  ollama: httpx.AsyncClient, отвечатель: Callable[[str], dict[str, Any]] | None = None,
                  состояние: Callable[[], dict[str, Any]] | None = None,
                  шаг: Callable[[str, str], dict[str, Any]] | None = None,
-                 нагрузка: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> None:
+                 нагрузка: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+                 телеграм: Callable[[str], dict[str, Any]] | None = None) -> None:
         self.настройки = настройки
         self.ключи = ключи
         self.журнал = журнал
@@ -73,6 +74,7 @@ class Сервис:
         self.ведро = Ведро(л.запросов_в_минуту)
         self.очередь = Очередь(л.очередь)
         self.отвечатель = отвечатель
+        self.телеграм = телеграм          # служба Telegram-бота: старт / стоп / перезапуск (telegram-plan D-T12)
         self.доп_состояние = состояние
         self.шаг = шаг
         self.нагрузка = нагрузка
@@ -454,5 +456,24 @@ def создать_приложение(с: Сервис) -> FastAPI:
             return ошибка(503, "Нагрузка с этой страницы недоступна.", "server_error", "load_disabled")
         итог = await asyncio.to_thread(с.нагрузка, await request.json())
         return JSONResponse(итог, status_code=409 if итог.get("error") else 200)
+
+    @app.post("/admin/api/telegram")
+    async def телеграм(request: Request):
+        запись = с.ключ(request, "админ")
+        if isinstance(запись, JSONResponse):
+            return запись
+        try:
+            действие = str((await request.json()).get("действие") or "")
+        except ValueError:
+            действие = ""
+        if действие not in ("старт", "стоп", "перезапуск"):
+            return ошибка(400, "Действие — старт, стоп или перезапуск.", "invalid_request_error", "bad_action")
+        if с.телеграм is None:
+            return ошибка(503, "Управление ботом с этой страницы недоступно.", "server_error", "telegram_disabled")
+        try:
+            итог = await asyncio.to_thread(с.телеграм, действие)
+        except (RuntimeError, ValueError, OSError) as exc:
+            return ошибка(409, str(exc), "server_error", "telegram_error")
+        return JSONResponse(итог)
 
     return app

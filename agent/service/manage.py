@@ -197,3 +197,97 @@ def нагрузка_фоном(параметры: dict[str, Any]) -> dict[str,
                              "документы": int(параметры.get("документы") or 0),
                              "max_tokens": int(параметры.get("max_tokens") or 200)}).start()
     return {"ok": True, "ступени": ступени}
+
+
+# --- Telegram-бот (telegram-plan D-T05, D-T12, D-T15) ------------------------------------
+
+ИМЯ_КЛЮЧА_БОТА = "телеграм"
+
+
+def секреты_бота() -> dict[str, str]:
+    """TELEGRAM_* из окружения или .env. Наружу (консоль, страница) — только «задан / не задан»."""
+    from dotenv import dotenv_values
+    файл = {к: з for к, з in dotenv_values(os.path.join(config.КОРЕНЬ, ".env")).items() if з}
+    return {к: os.environ.get(к) or файл.get(к, "") for к in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "TELEGRAM_API_BASE")}
+
+
+def файл_ключа_бота() -> str:
+    return os.path.join(config.каталог_данных(), "telegram.key")
+
+
+def бот_ключ() -> dict[str, Any]:
+    """Ключ «телеграм» (чат, документы) для бота — в файл 0600; прежний ключ с этим именем отзывается.
+    Сам ключ не возвращается: его читает только процесс бота."""
+    хранилище = хранилище_ключей()
+    if any(з["имя"] == ИМЯ_КЛЮЧА_БОТА and not з.get("отозван") for з in хранилище.список()):
+        хранилище.отозвать(ИМЯ_КЛЮЧА_БОТА)
+    ключ = хранилище.создать(ИМЯ_КЛЮЧА_БОТА, ["чат", "документы"])
+    путь = файл_ключа_бота()
+    временный = путь + ".tmp"
+    дескриптор = os.open(временный, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(дескриптор, "w", encoding="utf-8") as f:
+        f.write(ключ + "\n")
+    os.replace(временный, путь)
+    return {"имя": ИМЯ_КЛЮЧА_БОТА, "права": ["чат", "документы"], "файл": путь}
+
+
+def бот_служба(действие: str) -> dict[str, Any]:
+    """Служба day30-tg: установить, старт, стоп, перезапуск, статус — то же у консоли и /admin."""
+    if действие == "установить":
+        путь = unit.установить(sys.executable, config.КОРЕНЬ, os.path.dirname(config.каталог_данных()), unit.ИМЯ_БОТА)
+        return {"unit": путь, **unit.статус(unit.ИМЯ_БОТА)}
+    if действие in ("старт", "стоп", "перезапуск"):
+        готово = unit.systemctl({"старт": "start", "стоп": "stop", "перезапуск": "restart"}[действие], unit.ИМЯ_БОТА)
+        if готово.returncode != 0:
+            raise RuntimeError(готово.stderr.strip() or f"systemctl {действие}: код {готово.returncode}")
+        if действие != "стоп":
+            time.sleep(3)                    # getMe и первое состояние — пара секунд
+    elif действие != "статус":
+        raise ValueError(f"нет такого действия: {действие}")
+    return unit.статус(unit.ИМЯ_БОТА)
+
+
+def состояние_бота(записей: int = 15) -> dict[str, Any]:
+    """Для /admin и консоли: служба, состояние процесса бота, хвост его журнала — без текстов и ID владельца."""
+    from agent.service import telegram
+    from agent.service.journal import Журнал
+    каталог = config.каталог_данных()
+    try:
+        состояние = json.loads(Path(каталог, telegram.СОСТОЯНИЕ).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        состояние = None
+    журнал = Журнал(os.path.join(каталог, telegram.ЖУРНАЛ), поля=telegram.ПОЛЯ_ЖУРНАЛА)
+    хвост = журнал.последние(200)
+    с = секреты_бота()
+    return {"служба": unit.статус(unit.ИМЯ_БОТА), "состояние": состояние, "журнал": хвост[:записей],
+            "чужих": sum(1 for з in хвост if з.get("кто") == "чужой"),
+            "токен_задан": bool(с["TELEGRAM_BOT_TOKEN"]), "владелец_задан": bool(с["TELEGRAM_OWNER_ID"]),
+            "ключ_есть": os.path.exists(файл_ключа_бота())}
+
+
+def кто_писал() -> list[dict[str, Any]]:
+    """Кто писал боту (ID, имя пользователя, время) — чтобы записать TELEGRAM_OWNER_ID. Тексты не читаются.
+    Только при остановленном боте: два опросчика одного бота Telegram не допускает (409)."""
+    import httpx
+    from agent.service import telegram
+    if unit.статус(unit.ИМЯ_БОТА)["состояние"] == "active":
+        raise RuntimeError("бот работает — сначала python cli.py --телеграм стоп (иначе два опросчика)")
+    с = секреты_бота()
+    if not с["TELEGRAM_BOT_TOKEN"]:
+        raise RuntimeError("нет TELEGRAM_BOT_TOKEN в .env")
+    база = (с["TELEGRAM_API_BASE"] or telegram.API_TELEGRAM).rstrip("/")
+    try:
+        ответ = httpx.post(f"{база}/bot{с['TELEGRAM_BOT_TOKEN']}/getUpdates", json={"timeout": 0}, timeout=30).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RuntimeError(telegram.без_токена(f"Bot API: {type(exc).__name__}: {exc}")) from None
+    if not ответ.get("ok"):
+        raise RuntimeError(telegram.без_токена(f"Bot API: {ответ.get('description')}"))
+    кто: dict[int, dict[str, Any]] = {}
+    for о in ответ.get("result") or []:
+        с_ = о.get("message") or {}
+        от = с_.get("from") or {}
+        if от.get("id") is not None:
+            кто[от["id"]] = {"id": от["id"], "имя_пользователя": от.get("username") or "", "имя": от.get("first_name") or "",
+                            "чат": (с_.get("chat") or {}).get("type"), "когда": time.strftime(
+                                "%Y-%m-%d %H:%M", time.localtime(с_.get("date") or 0))}
+    return list(кто.values())

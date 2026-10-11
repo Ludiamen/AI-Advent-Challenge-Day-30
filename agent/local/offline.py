@@ -27,6 +27,11 @@
 Ollama из OLLAMA_HOST, даже если она стоит на соседней машине локальной сети;
 дополнительные адреса — OFFLINE_ALLOW через запятую.
 
+Разрешённый ВНЕШНИЙ хост (День 30, Telegram-бот) — OFFLINE_ALLOW_EXTERNAL через
+запятую: запрос к нему проходит и в офлайне, но считается внешним и виден в
+журнале по имени; всё прочее внешнее блокируется. Токен Bot API в пути
+(`/bot<токен>/…`) в журнал не попадает — для любого хоста.
+
 Включается режим переменной AGENT_OFFLINE=1 (её же получают дочерние
 MCP-серверы), ключом --офлайн в консоли и переключателем на странице.
 
@@ -45,6 +50,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -383,6 +389,19 @@ def _разрешённые() -> set[str]:
     return {х for х in хосты if х}
 
 
+def _разрешённые_внешние() -> set[str]:
+    """Внешние хосты, которые пропускаются и в офлайне (OFFLINE_ALLOW_EXTERNAL), но считаются внешними."""
+    return {х.strip().lower() for х in os.getenv("OFFLINE_ALLOW_EXTERNAL", "").split(",") if х.strip()}
+
+
+# Bot API Telegram кладёт токен прямо в путь: /bot123456:AA…/getUpdates.
+_ТОКЕН_В_ПУТИ = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
+
+
+def _путь_для_журнала(путь: str) -> str:
+    return _ТОКЕН_В_ПУТИ.sub("/bot…", путь.split("?")[0])[:80]
+
+
 def локальный(хост: str) -> bool:
     """Петлевой интерфейс, адрес Ollama или явно разрешённый (OFFLINE_ALLOW)."""
     хост = (хост or "").strip("[]").lower()
@@ -406,13 +425,13 @@ def _записать(метод: str, хост: str, путь: str, итог: s
         else:
             _счёт["заблокировано"] += 1
         _журнал.append({"when": time.strftime("%H:%M:%S"), "method": метод, "host": хост,
-                        "path": путь.split("?")[0][:80], "local": лок, "result": итог,
+                        "path": _путь_для_журнала(путь), "local": лок, "result": итог,
                         "model": модель, "offline": _включён, "n": _номер})
 
 
 def _проверить_запрос(request: httpx.Request) -> None:
     хост = request.url.host or ""
-    if _включён and not локальный(хост):
+    if _включён and not локальный(хост) and хост.lower() not in _разрешённые_внешние():
         _записать(request.method, хост, request.url.path, "заблокирован")
         raise ОшибкаОфлайна(f"Офлайн-режим: запрос к {хост} заблокирован — "
                             "наружу ходить нельзя, работают только локальные модели", request=request)

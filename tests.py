@@ -13942,6 +13942,8 @@ class КонсольИВебДня30(_ОсноваШлюза):
         self.assertNotRegex(скрыто, r"sk-day30-[A-Za-z0-9_-]{8,}")
         self.assertIn("sk-day30-…(скрыт в отчёте)", скрыто)
         self.assertIn("и sk-day30-…", скрыто, "многоточие из документации не трогается")
+        токен = "123456789:" + "AAbbCC_dd-" * 4                     # выдуманный токен Telegram
+        self.assertNotIn(токен, check_cli.скрыть_ключи(f"токен {токен} и путь /bot{токен}/getMe"))
 
     def test_ключи_из_консоли(self):
         память = tempfile.mkdtemp(prefix="консоль-сервиса-")
@@ -14003,6 +14005,709 @@ class ЖивыеПроверки(unittest.TestCase):
         finally:
             агент.close()
             shutil.rmtree(каталог, ignore_errors=True)
+
+
+
+# --- День 30, дополнение: Telegram-бот ------------------------------------------------
+
+from agent.service import pd as svc_pd  # noqa: E402
+
+
+class МаскаПД(unittest.TestCase):
+    """agent/service/pd.py: те же шаблоны, что у Дня 29, и маска «[скрыто]» перед отправкой в Telegram."""
+
+    def setUp(self):
+        self.корень = tempfile.mkdtemp(prefix="пд-")
+        self.addCleanup(shutil.rmtree, self.корень, True)
+        файл = os.path.join(self.корень, "pd-names.txt")
+        pathlib.Path(файл).write_text("# основы фамилий\nВымыслов\nПридумк\n", encoding="utf-8")
+        прежний = os.environ.get("PD_NAMES")
+        os.environ["PD_NAMES"] = файл
+        self.addCleanup(lambda: os.environ.pop("PD_NAMES", None) if прежний is None
+                        else os.environ.__setitem__("PD_NAMES", прежний))
+
+    def test_каждый_вид_скрыт_а_остальной_текст_цел(self):
+        текст = ("Контактное лицо: Вымыслов А. Б., тел. +7 (912) 345-67-89, e-mail ab.cd@mail.ru. "
+                 "Подписал И.И. Иванов; ответственный — Сергей Петрович Придумкина. "
+                 "Срок оплаты: не позднее 20 числа текущего месяца.")
+        self.assertTrue(svc_pd.найти(текст))
+        скрыт, виды = svc_pd.скрыть(текст)
+        self.assertEqual(svc_pd.найти(скрыт), [], скрыт)
+        for кусок in ("Вымыслов", "912", "ab.cd", "Иванов", "Петрович", "Сергей", "Придумкина"):
+            self.assertNotIn(кусок, скрыт)
+        self.assertIn("Срок оплаты: не позднее 20 числа текущего месяца.", скрыт)
+        self.assertIn(svc_pd.МАСКА, скрыт)
+        self.assertEqual(set(виды), {"фамилия и инициалы", "инициалы и фамилия", "отчество",
+                                     "фамилия из списка", "e-mail", "телефон"}, виды)
+        self.assertTrue(all(isinstance(n, int) and n > 0 for n in виды.values()))
+
+    def test_фамилия_от_основы_целым_словом(self):
+        скрыт, виды = svc_pd.скрыть("Согласовано: Вымысловский и Придумкиной.")
+        self.assertEqual(скрыт, f"Согласовано: {svc_pd.МАСКА} и {svc_pd.МАСКА}.")
+        self.assertEqual(виды, {"фамилия из списка": 2})
+
+    def test_инициалы_без_второй_точки_и_остатки(self):
+        # Живой ответ /doc (показ, сцена 5): «… клиентам М.В Фамилия — … инженер А В.[скрыто]» — фамилии нет
+        # в списке, а у инициалов нет второй точки: шаблон Дня 29 их не узнавал.
+        for текст in ("Начальник отдела М.В Выдуманный подписал", "Подписал: Выдуманный М.В", "инженер А В. Выдуманный",
+                      "инженер А.В.Выдуманный", "согласовано: А. В. Выдуманный"):
+            self.assertTrue(svc_pd.найти(текст), текст)
+            скрыт, виды = svc_pd.скрыть(текст)
+            self.assertNotIn("Выдуманный", скрыт, текст)
+            self.assertEqual(svc_pd.найти(скрыт), [], скрыт)
+        скрыт, _ = svc_pd.скрыть("главный инженер А В.Придумкин (действующий на основании)")
+        self.assertEqual(скрыт, f"главный инженер {svc_pd.МАСКА} (действующий на основании)", "инициалы не остаются рядом с маской")
+        for чисто in ("Договор № 337 от 09.09.2024", "п. 3.5 Порядок расчетов", "ПАО «Ростелеком», г. Москва"):
+            self.assertEqual(svc_pd.скрыть(чисто), (чисто, {}), чисто)
+
+    def test_латинские_двойники_букв(self):
+        # Живой ответ /doc: в распознанном договоре инициалы — латиницей («M.B», буквы LATIN), фамилия —
+        # кириллицей; шаблоны с [А-ЯЁ] их не видели — фамилия ушла в Telegram (показ, сцена 5).
+        латиница = "Начальник отдела M.B Выдуманный, тел."
+        self.assertIn("инициалы и фамилия", svc_pd.найти(латиница))
+        скрыт, виды = svc_pd.скрыть(латиница)
+        self.assertEqual(скрыт, f"Начальник отдела {svc_pd.МАСКА}, тел.")
+        смесь = "Ответственный: B" + "ымыслов"          # фамилия из списка с латинской «B»
+        self.assertIn("фамилия из списка", svc_pd.найти(смесь))
+        self.assertNotIn("ымыслов", svc_pd.скрыть(смесь)[0])
+        for чисто in ("Telegram Bot API, 4818 MB, HTTP 200", "ООО «Ромашка», ИНН указан в разделе 9"):
+            self.assertEqual(svc_pd.скрыть(чисто), (чисто, {}), чисто)
+
+    def test_без_пд_ничего_не_меняется(self):
+        текст = "Срок ежемесячной оплаты Услуг: не позднее 20 числа текущего месяца оказания Услуг."
+        self.assertEqual(svc_pd.скрыть(текст), (текст, {}))
+
+    def test_без_списка_фамилий_общие_шаблоны_и_признак(self):
+        self.assertTrue(svc_pd.список_есть())
+        os.environ["PD_NAMES"] = os.path.join(self.корень, "нет-такого.txt")
+        self.assertFalse(svc_pd.список_есть())
+        скрыт, виды = svc_pd.скрыть("Вымыслов, тел. 8 912 345 67 89")
+        self.assertIn("Вымыслов", скрыт, "без списка фамилия не узнаётся — об этом бот предупреждает")
+        self.assertEqual(виды, {"телефон": 1})
+
+    def test_день_29_тот_же(self):
+        # optbench.без_пд теперь берёт шаблоны отсюда — находки те же.
+        for текст in ("подписал Иванов И. И.", "Сергей Петрович", "пишите на ab.cd@mail.ru", "Вымыслов"):
+            self.assertEqual(rag_optbench.без_пд(текст), svc_pd.найти(текст), текст)
+        self.assertIs(rag_optbench.фамилии, svc_pd.фамилии)
+
+
+class СетьБота(_ОфлайнОснова):
+    """offline.py: разрешённый ВНЕШНИЙ хост (OFFLINE_ALLOW_EXTERNAL) и токен Bot API в журнале."""
+
+    ТОКЕН = "123456789:AAH-проба_x9ZZZZZZZZZZZZZZZZZZZZZZZZZZZ".replace("проба", "probe")
+
+    def test_разрешённый_внешний_пропущен_и_посчитан_внешним(self):
+        with mock.patch.dict(os.environ, {"OFFLINE_ALLOW_EXTERNAL": "api.telegram.org"}):
+            local_offline.включить(True, "тест")
+            local_offline._проверить_запрос(_httpx.Request("POST", f"https://api.telegram.org/bot{self.ТОКЕН}/getUpdates"))
+            local_offline._проверить_запрос(_httpx.Request("POST", "https://127.0.0.1:8443/v1/chat/completions"))
+            with self.assertRaises(local_offline.ОшибкаОфлайна):
+                local_offline._проверить_запрос(_httpx.Request("GET", "https://api.deepseek.com/models"))
+            self.assertFalse(local_offline.локальный("api.telegram.org"), "внешний остаётся внешним")
+        ж = local_offline.журнал()
+        self.assertEqual((ж["локальных"], ж["внешних"], ж["заблокировано"]), (1, 1, 1))
+        записи = {з["host"]: з for з in ж["recent"]}
+        self.assertEqual(записи["api.telegram.org"]["result"], "пропущен")
+        self.assertEqual(записи["api.telegram.org"]["path"], "/bot…/getUpdates")
+
+    def test_без_переменной_telegram_заблокирован_как_раньше(self):
+        local_offline.включить(True, "тест")
+        with self.assertRaises(local_offline.ОшибкаОфлайна):
+            local_offline._проверить_запрос(_httpx.Request("GET", f"https://api.telegram.org/bot{self.ТОКЕН}/getMe"))
+
+    def test_токен_не_попадает_в_журнал_и_разницу(self):
+        до = local_offline.снимок_журнала()
+        local_offline._проверить_запрос(_httpx.Request("POST", f"https://api.telegram.org/bot{self.ТОКЕН}/sendMessage"))
+        local_offline._проверить_запрос(_httpx.Request("POST", f"http://127.0.0.1:8081/bot{self.ТОКЕН}/editMessageText"))
+        дамп = _json.dumps(local_offline.журнал(), ensure_ascii=False)
+        self.assertNotIn(self.ТОКЕН.split(":")[1], дамп)
+        self.assertNotIn(self.ТОКЕН.split(":")[0], дамп)
+        self.assertIn("/bot…/sendMessage", дамп)
+        self.assertEqual(local_offline.разница(до, local_offline.снимок_журнала())["хосты"], ["api.telegram.org"])
+
+
+
+from agent.service import telegram as svc_tg  # noqa: E402
+
+
+class _ФальшивыйTelegram:
+    """Bot API в памяти: записывает вызовы (метод, тело), выдаёт message_id; отказы задаются заранее."""
+
+    def __init__(self):
+        self.вызовы: list[tuple[str, dict]] = []
+        self.обновления: list[list[dict]] = []
+        self.отказы: dict[str, list[tuple[int, dict]]] = {}
+        self.номер = 100
+        self.не_разбирать = False             # как Telegram, не разобравший HTML: 400 на parse_mode
+
+    def __call__(self, запрос):
+        метод = запрос.url.path.rsplit("/", 1)[-1]
+        тело = _json.loads(запрос.content or b"{}")
+        self.вызовы.append((метод, тело))
+        if self.не_разбирать and тело.get("parse_mode"):
+            return httpx.Response(400, json={"ok": False, "error_code": 400,
+                                             "description": "Bad Request: can't parse entities"})
+        if self.отказы.get(метод):
+            код, данные = self.отказы[метод].pop(0)
+            return httpx.Response(код, json=данные)
+        if метод == "sendMessage":
+            self.номер += 1
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": self.номер, "text": тело.get("text")}})
+        if метод == "editMessageText":
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": тело.get("message_id")}})
+        if метод == "getMe":
+            return httpx.Response(200, json={"ok": True, "result": {"id": 1, "username": "TestBot", "can_join_groups": False}})
+        if метод == "getUpdates":
+            return httpx.Response(200, json={"ok": True, "result": self.обновления.pop(0) if self.обновления else []})
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    def тексты(self, метод=None):
+        return [т.get("text") for м, т in self.вызовы if метод in (None, м) and "text" in т]
+
+    def методы(self):
+        return [м for м, _ in self.вызовы]
+
+
+class _ФальшивыйСервис:
+    """Сервис Дня 30 в памяти: ответы по очереди из списка, запросы записываются."""
+
+    def __init__(self):
+        self.чат: list = []
+        self.документы: list = []
+        self.запросы: list[tuple[str, dict]] = []
+        self.очереди: list[dict] = []         # что отдаёт /health по очереди; пусто — «ждут 2 из 4»
+
+    def __call__(self, запрос):
+        путь = запрос.url.path
+        тело = _json.loads(запрос.content) if запрос.content else {}
+        self.запросы.append((путь, тело))
+        if путь == "/health":
+            очередь = self.очереди.pop(0) if self.очереди else {"идёт": 1, "ждут": 2}
+            return httpx.Response(200, json={"status": "ok", "model": "loc-rag-docs", "queue": {
+                "мест_в_очереди": 4, "средняя_с": 26.2, "отказано": 0, "обслужено": 9, **очередь}})
+        очередь = self.чат if путь == "/v1/chat/completions" else self.документы
+        ответ = очередь.pop(0)
+        if isinstance(ответ, Exception):
+            raise ответ
+        код, заголовки, тело_ответа = ответ
+        if isinstance(тело_ответа, str):
+            return httpx.Response(код, headers=заголовки, text=тело_ответа)
+        return httpx.Response(код, headers=заголовки, json=тело_ответа)
+
+
+def _sse(*куски, вход=5, ответ=2, причина="stop", впереди=0, ошибка=None):
+    строки = [f": очередь {впереди}\n\n"]
+    for кусок in куски:
+        строки.append("data: " + _json.dumps({"choices": [{"index": 0, "delta": {"content": кусок},
+                                                          "finish_reason": None}]}, ensure_ascii=False) + "\n\n")
+    if ошибка:
+        строки.append("data: " + _json.dumps({"error": {"message": "сбой", "code": ошибка}}) + "\n\n")
+    else:
+        строки.append("data: " + _json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": причина}],
+                                              "usage": {"prompt_tokens": вход, "completion_tokens": ответ},
+                                              "x_queue_wait": 0.0}) + "\n\n")
+    строки.append("data: [DONE]\n\n")
+    return (200, {"content-type": "text/event-stream"}, "".join(строки))
+
+
+def _отказ(код, code, повтор=None):
+    заголовки = {"retry-after": str(повтор)} if повтор is not None else {}
+    return (код, заголовки, {"error": {"message": f"отказ {code}", "type": "x", "code": code}})
+
+
+class БотTelegram(unittest.IsolatedAsyncioTestCase):
+    """agent/service/telegram.py: бот — клиент сервиса; Telegram и сервис подменены (MockTransport)."""
+
+    ВЛАДЕЛЕЦ = 918273645    # девять цифр: проверка «ID не в состоянии» не спутает его с PID или временем
+
+    def setUp(self):
+        self.каталог = tempfile.mkdtemp(prefix="бот-")
+        self.addCleanup(shutil.rmtree, self.каталог, True)
+        self.tg, self.сервис, self.паузы = _ФальшивыйTelegram(), _ФальшивыйСервис(), []
+        self.номер_обновления = 0
+
+    def бот(self, владелец=ВЛАДЕЛЕЦ, правка_с=0.0):
+        api = svc_tg.BotAPI("123:TESTTOKEN", база="https://tg.test", transport=httpx.MockTransport(self.tg))
+        сервис = svc_tg.КлиентСервиса("https://svc.test", "sk-day30-test", transport=httpx.MockTransport(self.сервис))
+
+        async def пауза(секунд):
+            self.паузы.append(секунд)
+        return svc_tg.Бот(api, сервис, владелец=владелец, каталог=self.каталог, пауза=пауза, правка_с=правка_с)
+
+    def обн(self, текст, от=ВЛАДЕЛЕЦ, тип="private", чат=None):
+        self.номер_обновления += 1
+        return {"update_id": self.номер_обновления, "message": {
+            "message_id": self.номер_обновления, "from": {"id": от, "is_bot": False, "first_name": "Т"},
+            "chat": {"id": чат if чат is not None else от, "type": тип}, "date": int(time.time()), "text": текст}}
+
+    async def прогон(self, бот, *тексты, **ещё):
+        # Как человек: следующее сообщение — после ответа на предыдущее (одновременные — отдельный тест).
+        for т in тексты:
+            await бот.обработать(self.обн(т, **ещё))
+            await бот.дождаться()
+
+    def журнал(self):
+        путь = os.path.join(self.каталог, "telegram.jsonl")
+        return [_json.loads(с) for с in pathlib.Path(путь).read_text(encoding="utf-8").splitlines()] if os.path.exists(путь) else []
+
+    async def test_владелец_получает_ответ_потоком_с_подписью(self):
+        self.сервис.чат.append(_sse("При", "вет", "!", вход=24, ответ=3))
+        бот = self.бот()
+        await self.прогон(бот, "Скажи привет")
+        методы = self.tg.методы()
+        self.assertEqual(методы[0], "sendMessage", "сначала — заготовка")
+        self.assertTrue(self.tg.тексты("sendMessage")[0].startswith("⏳"))
+        правки = self.tg.тексты("editMessageText")
+        self.assertGreaterEqual(len(правки), 2, правки)
+        self.assertTrue(all(а != б for а, б in zip(правки, правки[1:])), "одинаковых правок подряд нет")
+        self.assertTrue(правки[-1].startswith("Привет!"))
+        self.assertIn("loc-rag-docs · вход 24 · ответ 3 токенов", правки[-1])
+        self.assertIn("typing", [т.get("action") for м, т in self.tg.вызовы if м == "sendChatAction"])
+        путь, тело = self.сервис.запросы[0]
+        self.assertEqual((путь, тело["stream"], тело["messages"][-1]["content"]), ("/v1/chat/completions", True, "Скажи привет"))
+        з = self.журнал()[-1]
+        self.assertEqual((з["кто"], з["вид"], з["код"], з["ответ"]), ("владелец", "чат", 200, 3))
+        await бот.закрыть()
+
+    async def test_правки_не_чаще_порога(self):
+        self.сервис.чат.append(_sse(*["слово "] * 30))
+        бот = self.бот(правка_с=3600)
+        await self.прогон(бот, "много слов")
+        self.assertEqual(len(self.tg.тексты("editMessageText")), 1, "только итоговая правка: порог не пройден")
+        await бот.закрыть()
+
+    async def test_история_и_new(self):
+        self.сервис.чат += [_sse("Париж"), _sse("Около 2 млн"), _sse("Да")]
+        бот = self.бот()
+        await self.прогон(бот, "Столица Франции?", "А сколько там жителей?")
+        второй = self.сервис.запросы[1][1]["messages"]
+        self.assertEqual([с["role"] for с in второй], ["user", "assistant", "user"])
+        self.assertEqual(второй[1]["content"], "Париж")
+        await self.прогон(бот, "/new", "Ты здесь?")
+        self.assertEqual(len(self.сервис.запросы[2][1]["messages"]), 1, "после /new история пуста")
+        self.assertIn("заново", self.tg.тексты("sendMessage")[-2])
+        await бот.закрыть()
+
+    async def test_история_не_длиннее_предела(self):
+        self.сервис.чат += [_sse(f"ответ {i}") for i in range(10)]
+        бот = self.бот()
+        await self.прогон(бот, *[f"вопрос {i}" for i in range(10)])
+        self.assertLessEqual(len(self.сервис.запросы[-1][1]["messages"]), svc_tg.ИСТОРИЯ + 1)
+        await бот.закрыть()
+
+    async def test_413_укорачивает_историю_сам(self):
+        self.сервис.чат += [_sse("раз"), _sse("два"), _отказ(413, "context_length_exceeded"), _sse("три")]
+        бот = self.бот()
+        await self.прогон(бот, "первый", "второй", "третий")
+        до, после = self.сервис.запросы[2][1]["messages"], self.сервис.запросы[3][1]["messages"]
+        self.assertEqual(len(после), len(до) - 2, "убрана самая старая пара")
+        self.assertTrue(self.tg.тексты("editMessageText")[-1].startswith("три"))
+        self.assertEqual(self.журнал()[-1]["укорочено"], 1)
+        await бот.закрыть()
+
+    async def test_413_один_вопрос_длиннее_окна(self):
+        self.сервис.чат.append(_отказ(413, "context_length_exceeded"))
+        бот = self.бот()
+        await self.прогон(бот, "очень длинный вопрос")
+        self.assertIn("длиннее окна модели", self.tg.тексты()[-1])
+        await бот.закрыть()
+
+    async def test_429_оба_кода_повторяемые(self):
+        # queue_full: место ждём по /health (раз в 5 с), не дольше Retry-After; rate_limited — пауза по ведру.
+        self.сервис.чат += [_отказ(429, "queue_full", 7), _отказ(429, "rate_limited", 10), _sse("готово")]
+        бот = self.бот()
+        await self.прогон(бот, "вопрос")
+        self.assertEqual(self.паузы, [5.0, 10.0])
+        тексты = self.tg.тексты()
+        self.assertTrue(any("как только освободится место" in т for т in тексты), тексты)
+        self.assertTrue(any("повторю через 10 с" in т for т in тексты), тексты)
+        self.assertTrue(тексты[-1].startswith("готово"))
+        self.assertEqual(self.журнал()[-1]["повторов_429"], 2)
+        await бот.закрыть()
+
+    async def test_queue_full_не_ждёт_весь_retry_after(self):
+        # Сервис оценил Retry-After в 741 с (медиана длинных генераций × очередь), а место освободилось
+        # через 15 с: бот повторяет, как только /health показывает место (находка check_telegram.py).
+        self.сервис.чат += [_отказ(429, "queue_full", 741), _sse("Москва")]
+        self.сервис.очереди = [{"идёт": 1, "ждут": 4}, {"идёт": 1, "ждут": 4}, {"идёт": 1, "ждут": 3}]
+        бот = self.бот()
+        await self.прогон(бот, "столица России?")
+        self.assertEqual(self.паузы, [5.0, 5.0, 5.0], "три опроса /health по 5 с, а не 741 с")
+        self.assertEqual([п for п, _ in self.сервис.запросы].count("/health"), 3)
+        self.assertTrue(self.tg.тексты()[-1].startswith("Москва"))
+        await бот.закрыть()
+
+    async def test_queue_full_не_дольше_retry_after(self):
+        self.сервис.чат += [_отказ(429, "queue_full", 12), _sse("ок")]
+        self.сервис.очереди = [{"идёт": 1, "ждут": 4}] * 10
+        бот = self.бот()
+        await self.прогон(бот, "вопрос")
+        self.assertEqual(sum(self.паузы), 12.0, "мест нет — повтор не позже Retry-After")
+        await бот.закрыть()
+
+    async def test_429_не_дольше_срока(self):
+        self.сервис.чат.append(_отказ(429, "rate_limited", 5000))
+        бот = self.бот()
+        await self.прогон(бот, "вопрос")
+        self.assertEqual(self.паузы, [], "пауза дольше срока — не ждать её зря")
+        self.assertIn("не освободилась", self.tg.тексты()[-1])
+        await бот.закрыть()
+
+    async def test_отказы_сервиса_понятным_текстом(self):
+        self.сервис.чат += [_отказ(401, "invalid_api_key"), _отказ(403, "permission_denied"),
+                            httpx.ConnectError("нет связи"), _отказ(502, "ollama_error"), _sse("нача", ошибка="timeout")]
+        бот = self.бот()
+        await self.прогон(бот, "1", "2", "3", "4", "5")
+        итоги = [т for т in self.tg.тексты("editMessageText")]
+        весь = "\n".join(итоги)
+        self.assertIn("--телеграм-ключ", весь)
+        self.assertIn("нет права", весь)
+        self.assertIn("Сервис не отвечает", весь)
+        self.assertIn("ollama_error", весь)
+        self.assertIn("поток прервался: timeout", итоги[-1])
+        self.assertTrue(итоги[-1].startswith("нача"), "начало ответа не теряется")
+        await бот.закрыть()
+
+    async def test_чужому_один_отказ_в_сутки_и_ни_одного_запроса_в_сервис(self):
+        бот = self.бот()
+        await self.прогон(бот, "привет", "ещё раз", от=918273699)
+        self.assertEqual(self.tg.тексты(), ["Это частный бот."])
+        self.assertEqual(self.сервис.запросы, [])
+        записи = self.журнал()
+        self.assertEqual([з["кто"] for з in записи], ["чужой", "чужой"])
+        self.assertNotIn("918273699", _json.dumps(записи), "ID чужого — только хэш")
+        self.assertEqual(len(записи[0]["чей"]), 8)
+        await бот.закрыть()
+
+    async def test_группа_покидается(self):
+        бот = self.бот()
+        await self.прогон(бот, "/start", чат=-100, тип="group")
+        self.assertEqual(self.tg.методы(), ["leaveChat"])
+        self.assertEqual(self.сервис.запросы, [])
+        await бот.закрыть()
+
+    async def test_без_владельца_никому_не_отвечает(self):
+        бот = self.бот(владелец=None)
+        await self.прогон(бот, "привет")
+        self.assertEqual((self.tg.вызовы, self.сервис.запросы), ([], []))
+        self.assertEqual(self.журнал()[-1]["вид"], "владелец не задан")
+        await бот.закрыть()
+
+    async def test_doc_маскирует_пд_и_проверяет_итог(self):
+        файл = os.path.join(self.каталог, "pd-names.txt")
+        pathlib.Path(файл).write_text("Вымыслов\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"PD_NAMES": файл}):
+            self.сервис.документы.append((200, {"x-queue-wait": "1.5"}, {
+                "answer": "Контактное лицо — Вымыслов А. Б., тел. +7 (912) 345-67-89.", "abstain": False,
+                "sources": [{"n": 1, "source": "Договор связи.pdf", "section": "18. Контактные данные"}],
+                "quotes": [{"n": 1, "text": "Ответственный: Вымыслов, ab.cd@mail.ru", "check": "дословно", "confirmed": True},
+                           {"n": 2, "text": "Срок оплаты — до 20 числа", "check": "дословно", "confirmed": True}],
+                "usage": {"prompt_tokens": 1800, "completion_tokens": 40}}))
+            бот = self.бот()
+            await self.прогон(бот, "/doc Кто контактное лицо?")
+            итог = self.tg.тексты("editMessageText")[-1]
+        self.assertEqual(svc_pd.найти(итог), [], итог)
+        for кусок in ("Вымыслов", "912", "ab.cd"):
+            self.assertNotIn(кусок, итог)
+        self.assertIn(svc_pd.МАСКА, итог)
+        self.assertIn("[1] Договор связи.pdf · 18. Контактные данные", итог)
+        self.assertIn("✓ дословно", итог)
+        self.assertIn("сокращена", итог)
+        self.assertIn("Скрыто фильтром ПД: 4", итог)
+        self.assertIn("не ловит", итог)
+        self.assertEqual(self.сервис.запросы[0], ("/v1/documents/answer", {"question": "Кто контактное лицо?"}))
+        з = self.журнал()[-1]
+        self.assertEqual((з["вид"], з["скрыто"]), ("документы", 4))
+        self.assertNotIn("Вымыслов", _json.dumps(self.журнал(), ensure_ascii=False))
+        await бот.закрыть()
+
+    async def test_doc_без_вопроса_и_слишком_длинный(self):
+        self.сервис.документы.append(_отказ(413, "question_too_long"))
+        бот = self.бот()
+        await self.прогон(бот, "/doc", "/doc " + "а" * 1200)
+        тексты = self.tg.тексты()
+        self.assertIn("/doc До какого числа", тексты[0])
+        self.assertIn("длиннее 1000 знаков", тексты[-1])
+        await бот.закрыть()
+
+    async def test_doc_не_знаю(self):
+        self.сервис.документы.append((200, {}, {"answer": "", "abstain": True, "sources": [], "quotes": [],
+                                                "clarification": "Уточните договор.", "usage": {}}))
+        бот = self.бот()
+        await self.прогон(бот, "/doc что-то")
+        итог = self.tg.тексты("editMessageText")[-1]
+        self.assertIn("Не знаю", итог)
+        self.assertIn("Уточните договор.", итог)
+        await бот.закрыть()
+
+    async def test_status_и_help(self):
+        бот = self.бот()
+        await self.прогон(бот, "/status", "/help")
+        статус, помощь = self.tg.тексты()
+        self.assertIn("идёт 1, ждут 2 из 4", статус)
+        self.assertEqual(self.сервис.запросы[0][0], "/health", "статус — не /v1/*: вне лимита ключа")
+        for кусок in ("/doc", "/new", "/status", "не ловит", "только владельцу"):
+            self.assertIn(кусок, помощь)
+        await бот.закрыть()
+
+    async def test_не_текст(self):
+        бот = self.бот()
+        обн = self.обн("")
+        del обн["message"]["text"]
+        обн["message"]["photo"] = [{"file_id": "x"}]
+        await бот.обработать(обн)
+        await бот.дождаться()
+        self.assertIn("только текст", self.tg.тексты()[-1])
+        await бот.закрыть()
+
+    async def test_длинный_ответ_двумя_сообщениями(self):
+        self.сервис.чат.append(_sse("а" * 2500, "б" * 2500))
+        бот = self.бот()
+        await self.прогон(бот, "длинно")
+        отправлено = self.tg.тексты("sendMessage")
+        self.assertEqual(len(отправлено), 2, "заготовка и продолжение")
+        self.assertLessEqual(max(len(т) for т in self.tg.тексты()), 4096)
+        self.assertTrue(отправлено[-1].rstrip().endswith("токенов · очередь 0.0 с · всего " +
+                                                         отправлено[-1].rsplit("всего ", 1)[1]))
+        await бот.закрыть()
+
+    async def test_429_telegram_на_правку(self):
+        self.tg.отказы["editMessageText"] = [(429, {"ok": False, "error_code": 429, "description": "Too Many Requests",
+                                                     "parameters": {"retry_after": 3}})]
+        self.сервис.чат.append(_sse("один", " два"))
+        бот = self.бот()
+        await self.прогон(бот, "вопрос")
+        self.assertIn(3, self.паузы)
+        self.assertTrue(self.tg.тексты("editMessageText")[-1].startswith("один два"))
+        self.assertEqual(self.журнал()[-1]["отказов_telegram"], 1)
+        await бот.закрыть()
+
+    async def test_одно_дело_за_раз(self):
+        self.сервис.чат += [_sse("первый"), _sse("второй")]
+        бот = self.бот()
+        await бот.обработать(self.обн("вопрос 1"))
+        await бот.обработать(self.обн("вопрос 2"))
+        await бот.дождаться()
+        self.assertTrue(any("отвечу после текущего" in т for т in self.tg.тексты()), self.tg.тексты())
+        self.assertEqual([т["messages"][-1]["content"] for _, т in self.сервис.запросы], ["вопрос 1", "вопрос 2"])
+        await бот.закрыть()
+
+    async def test_опрос_сохраняет_offset_и_читает_его_после_перезапуска(self):
+        self.сервис.чат.append(_sse("ок"))
+        self.tg.обновления = [[self.обн("вопрос")]]
+        бот = self.бот()
+        await бот.опросить_раз()
+        await бот.дождаться()
+        await бот.закрыть()
+        self.assertEqual(pathlib.Path(self.каталог, "telegram-offset").read_text().strip(), "2")
+        бот2 = self.бот()
+        await бот2.опросить_раз()
+        запросы = [т for м, т in self.tg.вызовы if м == "getUpdates"]
+        self.assertEqual(запросы[-1]["offset"], 2)
+        состояние = _json.loads(pathlib.Path(self.каталог, "telegram-state.json").read_text(encoding="utf-8"))
+        self.assertTrue(состояние["владелец_задан"])
+        self.assertNotIn(str(self.ВЛАДЕЛЕЦ), _json.dumps(состояние), "ID владельца в состояние не пишется")
+        await бот2.закрыть()
+
+    async def test_журнал_без_текстов(self):
+        self.сервис.чат.append(_sse("ОТВЕТ-МАРКЕР"))
+        бот = self.бот()
+        await self.прогон(бот, "ВОПРОС-МАРКЕР")
+        дамп = pathlib.Path(self.каталог, "telegram.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("МАРКЕР", дамп)
+        self.assertNotIn(str(self.ВЛАДЕЛЕЦ), дамп)
+        await бот.закрыть()
+
+    async def test_status_сразу_пока_идёт_ответ(self):
+        # Ручная проверка владельца: /status ждал 7 минут за длинным /doc в очереди бота.
+        отпустить = asyncio.Event()
+        прежний = self.сервис
+
+        async def медленный(запрос):
+            if запрос.url.path == "/v1/chat/completions":
+                await отпустить.wait()
+            return прежний(запрос)
+        self.сервис.чат.append(_sse("долгий ответ"))
+        api = svc_tg.BotAPI("123:TESTTOKEN", база="https://tg.test", transport=httpx.MockTransport(self.tg))
+        сервис = svc_tg.КлиентСервиса("https://svc.test", "sk-day30-test", transport=httpx.MockTransport(медленный))
+
+        async def пауза(секунд):
+            self.паузы.append(секунд)
+        бот = svc_tg.Бот(api, сервис, владелец=self.ВЛАДЕЛЕЦ, каталог=self.каталог, пауза=пауза, правка_с=0.0)
+        await бот.обработать(self.обн("длинный вопрос"))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await бот.обработать(self.обн("/status"))
+        тексты = self.tg.тексты()
+        self.assertTrue(any(т.startswith("Сервис: ok") for т in тексты), тексты)
+        self.assertFalse(any("отвечу после текущего" in т for т in тексты), "мгновенная команда — без очереди")
+        self.assertTrue(any("бот отвечает" in т for т in тексты if т.startswith("Сервис")), "статус говорит, что бот занят")
+        отпустить.set()
+        await бот.дождаться()
+        self.assertTrue(self.tg.тексты("editMessageText")[-1].startswith("долгий ответ"))
+        await бот.закрыть()
+
+    async def test_new_с_вопросом_отвечает_на_вопрос(self):
+        # «/new Сколько стоит …» — история очищена, вопрос не потерян.
+        self.сервис.чат += [_sse("раз"), _sse("ответ на вопрос")]
+        бот = self.бот()
+        await self.прогон(бот, "первый", "/new Сколько стоит VPN?")
+        последний = self.сервис.запросы[-1][1]["messages"]
+        self.assertEqual([с["content"] for с in последний], ["Сколько стоит VPN?"], "история пуста, вопрос ушёл")
+        self.assertIn("заново", " ".join(self.tg.тексты("sendMessage")))
+        self.assertTrue(self.tg.тексты("editMessageText")[-1].startswith("ответ на вопрос"))
+        await бот.закрыть()
+
+    def test_склонение_реплик(self):
+        self.assertEqual([svc_tg.реплик(n) for n in (0, 1, 2, 4, 5, 11, 12, 21, 22, 25)],
+                         ["0 реплик", "1 реплика", "2 реплики", "4 реплики", "5 реплик", "11 реплик", "12 реплик",
+                          "21 реплика", "22 реплики", "25 реплик"])
+
+    def test_markdown_в_html(self):
+        html_ = svc_tg.в_html("**Итог:** цена <б> & `код`\n### Раздел\n*   пункт\n- ещё")
+        self.assertEqual(html_, "<b>Итог:</b> цена &lt;б&gt; &amp; <code>код</code>\n<b>Раздел</b>\n• пункт\n• ещё")
+        self.assertEqual(svc_tg.в_html("2 * 3 = 6, а ** не пара"), "2 * 3 = 6, а ** не пара")
+
+    async def test_итог_с_разметкой_и_откат_на_простой_текст(self):
+        self.сервис.чат += [_sse("**Жирно** и `код`"), _sse("**снова**")]
+        бот = self.бот()
+        await self.прогон(бот, "вопрос")
+        итог = [т for м, т in self.tg.вызовы if м == "editMessageText"][-1]
+        self.assertEqual(итог.get("parse_mode"), "HTML")
+        self.assertTrue(итог["text"].startswith("<b>Жирно</b> и <code>код</code>"))
+        self.tg.не_разбирать = True
+        await self.прогон(бот, "ещё")
+        итог = [т for м, т in self.tg.вызовы if м == "editMessageText"][-1]
+        self.assertNotIn("parse_mode", итог, "Telegram не разобрал разметку — простой текст")
+        self.assertTrue(итог["text"].startswith("**снова**"))
+        await бот.закрыть()
+
+    def test_токен_скрыт_в_тексте_ошибок(self):
+        self.assertEqual(svc_tg.без_токена("ошибка https://api.telegram.org/bot123:AAbb-c_d/getMe"),
+                         "ошибка https://api.telegram.org/bot…/getMe")
+
+
+
+class СлужбаБота(_ОсноваШлюза):
+    """Служба day30-tg, ключ бота, состояние для /admin, консоль и ручка /admin/api/telegram."""
+
+    def test_unit_файл_бота(self):
+        т = svc_unit.текст_бота("/py", "/корень", "/память")
+        for кусок in ("ExecStart=/py /корень/telegram_bot.py", "Environment=MEMORY_DIR=/память",
+                      "After=network-online.target day30-llm.service", "Restart=on-failure",
+                      "RestartPreventExitStatus=2 3"):
+            self.assertIn(кусок, т)
+        self.assertNotIn("TELEGRAM", т, "секреты — в .env, не в unit-файле")
+        self.assertTrue(svc_unit.путь_unit(svc_unit.ИМЯ_БОТА).endswith("systemd/user/day30-tg.service"))
+        self.assertIn("service.py", svc_unit.текст("/py", "/корень", "/память"), "служба сервиса — как была")
+
+    def test_ключ_бота_файл_0600_и_старый_отозван(self):
+        from agent.service import manage
+        with mock.patch.dict(os.environ, {"MEMORY_DIR": self.каталог}):
+            первый = manage.бот_ключ()
+            путь = os.path.join(self.каталог, "service", "telegram.key")
+            self.assertEqual(oct(os.stat(путь).st_mode & 0o777), "0o600")
+            ключ1 = pathlib.Path(путь).read_text().strip()
+            второй = manage.бот_ключ()
+            ключ2 = pathlib.Path(путь).read_text().strip()
+            хранилище = manage.хранилище_ключей()
+            self.assertIsNone(хранилище.проверить(ключ1), "старый ключ бота отозван")
+            self.assertEqual(хранилище.проверить(ключ2)["права"], ["чат", "документы"])
+        self.assertEqual((первый["имя"], второй["файл"]), ("телеграм", путь))
+        self.assertNotIn("sk-day30-", _json.dumps(второй), "сам ключ наружу не отдаётся")
+
+    def test_состояние_бота_без_секретов(self):
+        from agent.service import manage
+        with mock.patch.dict(os.environ, {"MEMORY_DIR": self.каталог}):
+            пусто = manage.состояние_бота()
+            self.assertIsNone(пусто["состояние"])
+            каталог = os.path.join(self.каталог, "service")
+            pathlib.Path(каталог, "telegram-state.json").write_text(_json.dumps(
+                {"бот": "@TestBot", "владелец_задан": True, "последний_опрос": "2026-10-10T16:00:00"}), encoding="utf-8")
+            журнал = svc_journal.Журнал(os.path.join(каталог, "telegram.jsonl"), поля=svc_tg.ПОЛЯ_ЖУРНАЛА)
+            журнал.записать(кто="владелец", вид="чат", код=200, текст="ТЕКСТ-МАРКЕР")
+            журнал.записать(кто="чужой", чей="abcd1234", вид="отказ")
+            с = manage.состояние_бота()
+        self.assertEqual(с["состояние"]["бот"], "@TestBot")
+        self.assertEqual([з["кто"] for з in с["журнал"]], ["чужой", "владелец"], "новые первыми")
+        self.assertEqual(с["чужих"], 1)
+        self.assertNotIn("МАРКЕР", _json.dumps(с, ensure_ascii=False))
+        self.assertIn("состояние", с["служба"])
+
+    def test_ручка_telegram_только_для_админа(self):
+        вызовы = []
+        self.сервис.телеграм = lambda действие: вызовы.append(действие) or {"состояние": "active"}
+        тело = {"действие": "старт"}
+        self.assertEqual(self.клиент.post("/admin/api/telegram", json=тело, headers=self.h(self.к_чат)).status_code, 403)
+        r = self.клиент.post("/admin/api/telegram", json=тело, headers=self.h(self.к_админ))
+        self.assertEqual((r.status_code, r.json()["состояние"], вызовы), (200, "active", ["старт"]))
+        r = self.клиент.post("/admin/api/telegram", json={"действие": "удалить"}, headers=self.h(self.к_админ))
+        self.assertEqual(r.status_code, 400)
+        страница = self.клиент.get("/admin").text
+        for узел in ('id="телеграм-карта"', 'id="телеграм-старт"', 'id="телеграм-стоп"', "/admin/api/telegram"):
+            self.assertIn(узел, страница)
+
+    def test_консоль_бота_без_секретов(self):
+        память = tempfile.mkdtemp(prefix="консоль-бота-")
+        self.addCleanup(shutil.rmtree, память, True)
+        окр = {**os.environ, "MEMORY_DIR": память, "PYTHONIOENCODING": "utf-8",
+               "TELEGRAM_BOT_TOKEN": "123456:ПРОБНЫЙ-токен".replace("ПРОБНЫЙ", "PROBE"), "TELEGRAM_OWNER_ID": "424242"}
+        запуск = lambda *а: subprocess.run([sys.executable, "cli.py", *а], capture_output=True, text=True, env=окр,
+                                           cwd=os.path.dirname(os.path.abspath(__file__)), timeout=120)
+        r = запуск("--телеграм-ключ")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("telegram.key", r.stdout)
+        self.assertNotIn("sk-day30-", r.stdout + r.stderr)
+        r = запуск("--телеграм", "статус")
+        вывод = r.stdout + r.stderr
+        self.assertIn("Служба day30-tg", вывод)
+        self.assertIn("владелец: задан", вывод)
+        for секрет in ("PROBE", "424242"):
+            self.assertNotIn(секрет, вывод)
+
+
+
+class ПоказTelegram(unittest.TestCase):
+    """Показ бота: режим «телеграм» в browser.mjs, demo_telegram.sh, раздел DEMO-CHROME.md."""
+
+    @classmethod
+    def setUpClass(cls):
+        корень = os.path.dirname(os.path.abspath(__file__))
+        читать = lambda *ч: pathlib.Path(корень, *ч).read_text(encoding="utf-8")
+        водитель = читать("browser.mjs")
+        cls.блок = водитель.split("if (РЕЖИМ === 'телеграм')")[1].split("if (РЕЖИМ === 'показ')")[0]
+        cls.скрипт = читать("demo_telegram.sh")
+        cls.сценарий = читать("DEMO-CHROME.md").split("## Дополнение: показ Telegram-бота")[1]
+        cls.админ = читать("templates", "service_admin.html")
+        cls.путь_скрипта = os.path.join(корень, "demo_telegram.sh")
+
+    def test_шесть_сцен_и_только_чат_бота(self):
+        for номер in range(1, 7):
+            self.assertIn(f"'Сцена {номер}'", self.блок)
+            self.assertIn(f"| {номер} |", self.сценарий)
+        self.assertNotIn("'Сцена 7'", self.блок)
+        self.assertIn("открыт не чат с ботом", self.блок, "перед отправкой — сверка заголовка чата")
+        for селектор in (".chat-info .peer-title", ".input-message-input[contenteditable]", ".bubble.is-in"):
+            self.assertIn(селектор, self.блок)
+        self.assertIn("process.exit(0)", self.блок)
+        self.assertIn("process.env.MARKS", self.блок)
+        for узел in ("телеграм-служба", "телеграм-сеть", "телеграм-журнал", "телеграм-карта"):
+            self.assertIn(узел, self.блок)
+            self.assertIn(f'id="{узел}"', self.админ)
+
+    def test_скрипт_показа_бота(self):
+        self.assertTrue(os.access(self.путь_скрипта, os.X_OK))
+        self.assertEqual(_subprocess.run(["bash", "-n", self.путь_скрипта], capture_output=True).returncode, 0)
+        справка = _subprocess.run(["bash", self.путь_скрипта, "--help"], capture_output=True, text=True, timeout=60)
+        self.assertIn("Запуск:", справка.stdout)
+        for кусок in ('"credentials_enable_service"', "--window-size=880,980", 'record_demo.sh" --name телеграм --pid',
+                      "--сервис-отозвать", "user-data-dir=\"$PROFILE\""):
+            self.assertIn(кусок, self.скрипт)
+        self.assertNotIn('rm -rf "$PROFILE"', self.скрипт, "профиль с сеансом удаляет владелец, не скрипт")
+        self.assertIn("CDP_TIMEOUT=60000", self.скрипт, "подвисшая страница не вешает показ")
+        водитель = pathlib.Path(os.path.dirname(os.path.abspath(__file__)), "browser.mjs").read_text(encoding="utf-8")
+        self.assertIn("process.env.CDP_TIMEOUT", водитель)
 
 
 if __name__ == "__main__":

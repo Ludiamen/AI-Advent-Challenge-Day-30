@@ -1,0 +1,717 @@
+"""Telegram-бот Дня 30: владелец говорит с локальной моделью через приватный сервис.
+
+Бот — ещё один клиент сервиса (telegram-plan D-T01): ходит в /v1/chat/completions и
+/v1/documents/answer по HTTPS со своим ключом, модель напрямую не вызывает; лимиты,
+очередь и предел контекста — сервиса. Сообщения получает long polling'ом (D-T03):
+входящих соединений нет. Отвечает только владельцу (D-T04); ответ идёт потоком —
+бот правит своё сообщение не чаще раза в `правка_с` (D-T07); история чата — в памяти
+процесса (D-T06); ответы по документам перед отправкой проходят маску ПД (D-T10).
+
+  BotAPI(токен, база)                 getMe, getUpdates, sendMessage, editMessageText, …
+  КлиентСервиса(адрес, ключ, ca)      чат(сообщения, при_событии), документы(вопрос), здоровье()
+  Бот(api, сервис, владелец, каталог) обработать(update), опросить_раз(), опрашивать(стоп)
+
+Журнал бота (`telegram.jsonl`) и состояние для /admin (`telegram-state.json`) — без
+текстов вопросов и ответов, без ID владельца; ID чужих — первые 8 знаков sha256.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import html
+import json
+import os
+import re
+import ssl
+import time
+from collections import Counter
+from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
+
+import httpx
+
+from agent.service import pd
+from agent.service.journal import Журнал
+
+API_TELEGRAM = "https://api.telegram.org"
+ИСТОРИЯ = 12                 # реплик в памяти на чат (6 пар)
+ПРАВКА_С = 1.5               # правка сообщения не чаще (ворота 0, A-T2: 40 правок без 429)
+ПЕЧАТАЕТ_С = 4.0             # «печатает…» пока ждём
+ДОКУМЕНТЫ_ХОД_С = 15.0       # правка «ищу в документах… N с»
+СРОК_С = 1200.0              # общий срок ответа с повторами после 429 (как service_load.py)
+ОПРОС_МЕСТА_С = 5.0          # queue_full: раз в N с смотреть /health — не освободилось ли место
+ДЛИНА = 4000                 # предел Telegram — 4096 символов на сообщение
+ОПРОС_С = 25                 # ожидание getUpdates (A-T1)
+ЧУЖОМУ_РАЗ_В_С = 86400.0     # «это частный бот» — не чаще раза в сутки на человека
+ЖУРНАЛ = "telegram.jsonl"
+# Белый список журнала бота: текстов и ID владельца в нём нет и быть не может.
+ПОЛЯ_ЖУРНАЛА = ("время", "кто", "чей", "вид", "команда", "код", "ошибка", "вход", "ответ", "ожидание_с",
+                "длительность_с", "правок", "отказов_telegram", "повторов_429", "укорочено", "скрыто", "виды_пд")
+СОСТОЯНИЕ = "telegram-state.json"
+OFFSET = "telegram-offset"
+
+_ТОКЕН = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
+
+
+def без_токена(текст: str) -> str:
+    """Токен Bot API стоит в пути запроса — из любого текста ошибки он убирается."""
+    return _ТОКЕН.sub("/bot…", текст or "")
+
+
+def _хэш(значение: Any) -> str:
+    return hashlib.sha256(str(значение).encode()).hexdigest()[:8]
+
+
+def _секунды(с: float) -> str:
+    return f"{с:g}" if float(с).is_integer() else f"{с:.1f}"
+
+
+class ОшибкаTelegram(Exception):
+    def __init__(self, код: int, описание: str, повтор: float | None = None) -> None:
+        super().__init__(f"Telegram {код}: {без_токена(описание)}")
+        self.код, self.описание, self.повтор = код, без_токена(описание), повтор
+
+
+class BotAPI:
+    """Шесть методов Bot API на httpx (D-T02): токен — только в пути запроса."""
+
+    def __init__(self, токен: str, база: str = API_TELEGRAM, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        self._токен = токен
+        self.база = база.rstrip("/")
+        self._http = httpx.AsyncClient(base_url=self.база, transport=transport,
+                                       timeout=httpx.Timeout(ОПРОС_С + 15, connect=10))
+
+    async def вызвать(self, метод: str, **поля: Any) -> Any:
+        тело = {к: в for к, в in поля.items() if в is not None}
+        r = await self._http.post(f"/bot{self._токен}/{метод}", json=тело)
+        try:
+            д = r.json()
+        except ValueError:
+            raise ОшибкаTelegram(r.status_code, f"ответ не JSON (HTTP {r.status_code})") from None
+        if not д.get("ok"):
+            raise ОшибкаTelegram(int(д.get("error_code") or r.status_code), str(д.get("description") or ""),
+                                 (д.get("parameters") or {}).get("retry_after"))
+        return д.get("result")
+
+    async def getMe(self) -> dict:
+        return await self.вызвать("getMe")
+
+    async def getUpdates(self, offset: int | None, timeout: int = ОПРОС_С) -> list[dict]:
+        return await self.вызвать("getUpdates", offset=offset, timeout=timeout, allowed_updates=["message"])
+
+    async def sendMessage(self, чат: int, текст: str, разметка: bool = False) -> dict:
+        return await self.вызвать("sendMessage", chat_id=чат, text=текст, parse_mode="HTML" if разметка else None)
+
+    async def editMessageText(self, чат: int, сообщение: int, текст: str, разметка: bool = False) -> Any:
+        return await self.вызвать("editMessageText", chat_id=чат, message_id=сообщение, text=текст,
+                                  parse_mode="HTML" if разметка else None)
+
+    async def sendChatAction(self, чат: int, действие: str = "typing") -> Any:
+        return await self.вызвать("sendChatAction", chat_id=чат, action=действие)
+
+    async def leaveChat(self, чат: int) -> Any:
+        return await self.вызвать("leaveChat", chat_id=чат)
+
+    async def закрыть(self) -> None:
+        await self._http.aclose()
+
+
+class КлиентСервиса:
+    """Приватный сервис Дня 30 глазами бота: HTTPS, ключ «телеграм», сертификат — по своему центру."""
+
+    def __init__(self, адрес: str, ключ: str, ca: str | None = None, transport: httpx.AsyncBaseTransport | None = None,
+                 модель: str = "loc-rag-docs") -> None:
+        self.адрес, self.модель = адрес.rstrip("/"), модель
+        проверка: Any = ssl.create_default_context(cafile=ca) if ca else True
+        self._http = httpx.AsyncClient(base_url=self.адрес, transport=transport, verify=проверка,
+                                       headers={"Authorization": f"Bearer {ключ}"},
+                                       timeout=httpx.Timeout(СРОК_С, connect=10))
+
+    @staticmethod
+    def _отказ(r: httpx.Response, тело: bytes) -> dict[str, Any]:
+        try:
+            ошибка = (json.loads(тело) or {}).get("error") or {}
+        except ValueError:
+            ошибка = {}
+        повтор = r.headers.get("retry-after")
+        return {"код": r.status_code, "код_ошибки": ошибка.get("code") or str(r.status_code),
+                "ошибка": str(ошибка.get("message") or ""), "повтор_через": float(повтор) if повтор else None}
+
+    async def чат(self, сообщения: list[dict], при_событии: Callable[[str, Any], Awaitable[None]]) -> dict[str, Any]:
+        итог: dict[str, Any] = {"код": None, "текст": "", "причина": None, "вход": None, "ответ": None,
+                                "ожидание": 0.0, "код_ошибки": None, "ошибка": "", "повтор_через": None}
+        try:
+            async with self._http.stream("POST", "/v1/chat/completions",
+                                         json={"model": self.модель, "stream": True, "messages": сообщения}) as r:
+                if r.status_code != 200:
+                    итог.update(self._отказ(r, await r.aread()))
+                    return итог
+                итог["код"] = 200
+                async for строка in r.aiter_lines():
+                    if строка.startswith(":"):
+                        число = re.search(r"(\d+)\s*$", строка)
+                        if число:
+                            await при_событии("очередь", int(число.group(1)))
+                        continue
+                    if not строка.startswith("data: "):
+                        continue
+                    данные = строка[6:]
+                    if данные == "[DONE]":
+                        break
+                    ч = json.loads(данные)
+                    if "error" in ч:
+                        итог["код_ошибки"] = ч["error"].get("code") or "error"
+                        итог["ошибка"] = str(ч["error"].get("message") or "")
+                        break
+                    выбор = (ч.get("choices") or [{}])[0]
+                    кусок = (выбор.get("delta") or {}).get("content") or ""
+                    if кусок:
+                        итог["текст"] += кусок
+                        await при_событии("текст", итог["текст"])
+                    if выбор.get("finish_reason"):
+                        итог["причина"] = выбор["finish_reason"]
+                        итог["вход"] = (ч.get("usage") or {}).get("prompt_tokens")
+                        итог["ответ"] = (ч.get("usage") or {}).get("completion_tokens")
+                        итог["ожидание"] = float(ч.get("x_queue_wait") or 0.0)
+        except httpx.HTTPError as exc:
+            итог.update({"код_ошибки": "сеть", "ошибка": без_токена(f"{type(exc).__name__}: {exc}")})
+        return итог
+
+    async def документы(self, вопрос: str) -> dict[str, Any]:
+        итог: dict[str, Any] = {"код": None, "код_ошибки": None, "ошибка": "", "повтор_через": None,
+                                "данные": None, "ожидание": 0.0}
+        try:
+            r = await self._http.post("/v1/documents/answer", json={"question": вопрос})
+        except httpx.HTTPError as exc:
+            итог.update({"код_ошибки": "сеть", "ошибка": f"{type(exc).__name__}: {exc}"})
+            return итог
+        if r.status_code != 200:
+            итог.update(self._отказ(r, r.content))
+            return итог
+        итог.update({"код": 200, "данные": r.json(), "ожидание": float(r.headers.get("x-queue-wait") or 0.0)})
+        return итог
+
+    async def здоровье(self) -> dict[str, Any]:
+        r = await self._http.get("/health")
+        r.raise_for_status()
+        return r.json()
+
+    async def закрыть(self) -> None:
+        await self._http.aclose()
+
+
+ПОМОЩЬ = (
+    "Это частный бот: модель loc-rag-docs работает на домашнем сервере и отвечает только владельцу.\n\n"
+    "• Напишите вопрос — ответ придёт потоком. Бот помнит последние {пар} пар реплик (до своего перезапуска).\n"
+    "• /new — начать разговор заново.\n"
+    "• /doc вопрос — ответ по документам организации с источником и цитатой. Перед отправкой в Telegram "
+    "ответ проходит фильтр ПД: скрываются фамилии из списка, отчества, инициалы, e-mail и телефоны. "
+    "Фильтр не ловит: {не_ловит}.\n"
+    "• /status — состояние сервиса и очереди.\n\n"
+    "Сообщения идут через серверы Telegram; модель и документы — только на домашнем сервере."
+)
+СРАЗУ = ("/start", "/help", "/status")      # мгновенные команды — вне очереди бота (ручная проверка)
+
+
+def реплик(n: int) -> str:
+    форма = "реплика" if n % 10 == 1 and n % 100 != 11 else (
+        "реплики" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "реплик")
+    return f"{n} {форма}"
+
+
+def в_html(текст: str) -> str:
+    """Частая разметка модели (Markdown) — в HTML Telegram, остальное экранируется. Модель пишет
+    «**жирно**», заголовки «###» и списки «*   …»; простым текстом они видны звёздочками (ручная
+    проверка владельца). Курсив «*…*» не трогается: звёздочка бывает умножением."""
+    т = html.escape(текст or "", quote=False)
+    т = re.sub(r"```(?:[\w+-]+\n)?(.+?)```", r"<pre>\1</pre>", т, flags=re.S)
+    т = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", т)
+    т = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"<b>\1</b>", т)
+    т = re.sub(r"(?m)^#{1,6}\s+(.+?)\s*$", r"<b>\1</b>", т)
+    т = re.sub(r"(?m)^(\s*)[*-]\s+", r"\1• ", т)
+    return т
+
+
+ПРИМЕР_DOC = "Напишите вопрос после /doc, например: /doc До какого числа нужно оплачивать услуги связи по договору VPN?"
+
+
+class _Вывод:
+    """Одно сообщение бота, которое дописывается: заготовка, правки не чаще порога, итог, продолжение."""
+
+    def __init__(self, бот: "Бот", чат: int) -> None:
+        self.бот, self.чат = бот, чат
+        self.ид: int | None = None
+        self.показано = ""
+        self.момент = 0.0
+        self.правок = 0
+        self.отказов_telegram = 0
+        self._ход: asyncio.Task | None = None
+
+    async def начать(self, текст: str, ход: Callable[[float], str] | None = None) -> None:
+        ответ = await self.бот.api.sendMessage(self.чат, текст)
+        self.ид, self.показано, self.момент = ответ["message_id"], текст, self.бот.часы()
+        await self._печатает()
+        self._ход = asyncio.ensure_future(self._ждать(ход))
+
+    async def _печатает(self) -> None:
+        try:
+            await self.бот.api.sendChatAction(self.чат)
+        except (ОшибкаTelegram, httpx.HTTPError):
+            pass
+
+    async def _ждать(self, ход: Callable[[float], str] | None) -> None:
+        """«Печатает…» раз в ПЕЧАТАЕТ_С и, для документов, «… N с» раз в ДОКУМЕНТЫ_ХОД_С — пока нет текста."""
+        начало = time.monotonic()
+        прошлый_ход = начало
+        while True:
+            await asyncio.sleep(ПЕЧАТАЕТ_С)
+            await self._печатает()
+            if ход and time.monotonic() - прошлый_ход >= ДОКУМЕНТЫ_ХОД_С:
+                прошлый_ход = time.monotonic()
+                await self.правка(ход(time.monotonic() - начало), срочно=True)
+
+    def хватит_ждать(self) -> None:
+        if self._ход and not self._ход.done():
+            self._ход.cancel()
+
+    async def правка(self, текст: str, срочно: bool = False, разметка: bool = False) -> None:
+        текст = текст[:ДЛИНА + 50]
+        if текст == self.показано or self.ид is None:
+            return
+        if not срочно and self.бот.часы() - self.момент < self.бот.правка_с:
+            return
+        for _ in range(3 if срочно else 1):
+            try:
+                await self.бот.api.editMessageText(self.чат, self.ид, в_html(текст) if разметка else текст, разметка)
+            except ОшибкаTelegram as exc:
+                if exc.повтор:
+                    self.отказов_telegram += 1
+                    await self.бот.пауза(float(exc.повтор))
+                    continue
+                if разметка and exc.код == 400 and "parse" in exc.описание:
+                    разметка = False           # Telegram не разобрал HTML — тот же текст простым
+                    continue
+                if "not modified" not in exc.описание:
+                    raise
+            self.правок += 1
+            self.показано, self.момент = текст, self.бот.часы()
+            return
+
+    async def событие(self, вид: str, значение: Any) -> None:
+        if вид == "очередь":
+            await self.правка(f"⏳ в очереди сервиса: впереди {значение}" if значение else "⏳ модель отвечает…")
+        elif вид == "текст":
+            self.хватит_ждать()
+            await self.правка(значение[:ДЛИНА] + " ▍")
+
+    async def закончить(self, текст: str, разметка: bool = True) -> None:
+        """Итог: первая часть — правкой заготовки, остальное — новыми сообщениями по ДЛИНА; разметка
+        модели — HTML Telegram (не разобрал — простой текст)."""
+        self.хватит_ждать()
+        части = [текст[i:i + ДЛИНА] for i in range(0, len(текст), ДЛИНА)] or [""]
+        await self.правка(части[0], срочно=True, разметка=разметка)
+        for часть in части[1:]:
+            try:
+                await self.бот.api.sendMessage(self.чат, в_html(часть) if разметка else часть, разметка)
+            except ОшибкаTelegram as exc:
+                if not (разметка and exc.код == 400 and "parse" in exc.описание):
+                    raise
+                await self.бот.api.sendMessage(self.чат, часть)
+
+
+class Бот:
+    """Логика бота: кто пишет, команды, очередь бота, история, поток, документы, журнал и состояние."""
+
+    def __init__(self, api: BotAPI, сервис: КлиентСервиса, владелец: int | None, каталог: str,
+                 пауза: Callable[[float], Awaitable[None]] = asyncio.sleep, правка_с: float = ПРАВКА_С,
+                 часы: Callable[[], float] = time.monotonic, сеть: Callable[[], dict] | None = None) -> None:
+        self.api, self.сервис, self.владелец = api, сервис, владелец
+        self.каталог, self.пауза, self.правка_с, self.часы, self.сеть = каталог, пауза, правка_с, часы, сеть
+        os.makedirs(каталог, exist_ok=True)
+        self.журнал = Журнал(os.path.join(каталог, ЖУРНАЛ), поля=ПОЛЯ_ЖУРНАЛА)
+        self.имя = ""
+        self._история: dict[int, list[dict]] = {}
+        self._очереди: dict[int, asyncio.Queue] = {}
+        self._работники: dict[int, asyncio.Task] = {}
+        self._в_работе: Counter = Counter()
+        self._чужие: dict[str, float] = {}
+        self.события: Counter = Counter()
+        self.опросов = 0
+        self.ошибок_сети_подряд = 0
+        self.последняя_ошибка = ""
+        self.последний_опрос = ""
+
+    # --- кто пишет --------------------------------------------------------------------
+
+    async def обработать(self, обновление: dict) -> None:
+        сообщение = обновление.get("message") or {}
+        if not сообщение:
+            return
+        чат = сообщение.get("chat") or {}
+        от = (сообщение.get("from") or {}).get("id")
+        if чат.get("type") != "private":
+            self._записать(кто="группа", вид="покинута")
+            try:
+                await self.api.leaveChat(чат.get("id"))
+            except (ОшибкаTelegram, httpx.HTTPError):
+                pass
+            return
+        if self.владелец is None:
+            self._записать(кто="?", вид="владелец не задан")
+            return
+        if от != self.владелец:
+            await self._чужой(чат.get("id"), от)
+            return
+        текст = сообщение.get("text")
+        команда = (текст or "").partition(" ")[0].split("@")[0].lower()
+        if команда in СРАЗУ:
+            await self._ответить(чат["id"], текст)      # справка и статус — сразу, не за длинным ответом
+            return
+        await self._в_очередь(чат["id"], текст)
+
+    async def _чужой(self, чат: int, от: Any) -> None:
+        чей = _хэш(от)
+        сейчас = self.часы()
+        if сейчас - self._чужие.get(чей, -ЧУЖОМУ_РАЗ_В_С) >= ЧУЖОМУ_РАЗ_В_С:
+            self._чужие[чей] = сейчас
+            self._записать(кто="чужой", чей=чей, вид="отказ")
+            try:
+                await self.api.sendMessage(чат, "Это частный бот.")
+            except (ОшибкаTelegram, httpx.HTTPError):
+                pass
+        else:
+            self._записать(кто="чужой", чей=чей, вид="тишина")
+
+    # --- одно дело за раз (D-T08) -------------------------------------------------------
+
+    async def _в_очередь(self, чат: int, текст: str | None) -> None:
+        очередь = self._очереди.setdefault(чат, asyncio.Queue())
+        if self._в_работе[чат]:
+            try:
+                await self.api.sendMessage(чат, "⏳ Принял — отвечу после текущего ответа.")
+            except (ОшибкаTelegram, httpx.HTTPError):
+                pass
+        self._в_работе[чат] += 1
+        await очередь.put(текст)
+        if чат not in self._работники or self._работники[чат].done():
+            self._работники[чат] = asyncio.ensure_future(self._работник(чат))
+
+    async def _работник(self, чат: int) -> None:
+        очередь = self._очереди[чат]
+        while True:
+            текст = await очередь.get()
+            try:
+                await self._ответить(чат, текст)
+            except Exception as exc:  # noqa: BLE001 — работник не должен умирать от одного сообщения
+                self._записать(кто="владелец", вид="ошибка бота", ошибка=без_токена(type(exc).__name__))
+                try:
+                    await self.api.sendMessage(чат, f"Внутренняя ошибка бота: {type(exc).__name__}.")
+                except (ОшибкаTelegram, httpx.HTTPError):
+                    pass
+            finally:
+                self._в_работе[чат] -= 1
+                очередь.task_done()
+
+    async def дождаться(self) -> None:
+        for очередь in list(self._очереди.values()):
+            await очередь.join()
+
+    # --- команды ------------------------------------------------------------------------
+
+    async def _ответить(self, чат: int, текст: str | None) -> None:
+        if not текст:
+            await self.api.sendMessage(чат, "Пока понимаю только текст: вопрос модели, /doc вопрос, /new, /status.")
+            self._записать(кто="владелец", вид="не текст")
+            return
+        if not текст.startswith("/"):
+            await self._чат(чат, текст)
+            return
+        команда, _, остаток = текст.partition(" ")
+        команда = команда.split("@")[0].lower()
+        if команда in ("/start", "/help"):
+            ответ = ПОМОЩЬ.format(пар=ИСТОРИЯ // 2, не_ловит=pd.НЕ_ЛОВИТ)
+            if not pd.список_есть():
+                ответ += "\n\n⚠ Список фамилий не найден — фамилии сейчас не проверяются."
+            await self.api.sendMessage(чат, ответ)
+        elif команда == "/new":
+            self._история.pop(чат, None)
+            await self.api.sendMessage(чат, "История очищена — начинаем заново.")
+            if остаток.strip():                 # «/new вопрос» — вопрос не теряется (ручная проверка)
+                self._записать(кто="владелец", вид="команда", команда=команда)
+                await self._чат(чат, остаток.strip())
+                return
+        elif команда == "/status":
+            await self.api.sendMessage(чат, await self._статус(чат))
+        elif команда == "/doc":
+            if not остаток.strip():
+                await self.api.sendMessage(чат, ПРИМЕР_DOC)
+            else:
+                await self._документы(чат, остаток.strip())
+                return
+        else:
+            await self.api.sendMessage(чат, "Не знаю такой команды. /help — что умею.")
+        self._записать(кто="владелец", вид="команда", команда=команда)
+
+    async def _статус(self, чат: int) -> str:
+        try:
+            з = await self.сервис.здоровье()
+        except httpx.HTTPError as exc:
+            return f"Сервис не отвечает ({type(exc).__name__}): python cli.py --сервис статус"
+        о = з.get("queue") or {}
+        занят = self._в_работе[чат]
+        return (f"Сервис: {з.get('status')} · модель {з.get('model')}\n"
+                f"Очередь: идёт {о.get('идёт')}, ждут {о.get('ждут')} из {о.get('мест_в_очереди')} · "
+                f"средняя генерация {о.get('средняя_с')} с\n"
+                + (f"Сейчас бот отвечает на предыдущее сообщение; ждут ещё: {занят - 1}.\n" if занят else "")
+                + f"История этого чата: {реплик(len(self._история.get(чат, [])))} (до перезапуска бота).")
+
+    # --- отказы сервиса (D-T09) -----------------------------------------------------------
+
+    @staticmethod
+    def _текст_отказа(итог: dict) -> str:
+        код, code, сообщение = итог.get("код"), итог.get("код_ошибки"), итог.get("ошибка") or ""
+        if code == "сеть":
+            return f"Сервис не отвечает ({сообщение}): python cli.py --сервис статус"
+        if код == 401:
+            return "Ключ бота не принят сервисом — создайте новый: python cli.py --телеграм-ключ"
+        if код == 403:
+            return f"У ключа бота нет права на это: {сообщение}"
+        if code == "question_too_long":
+            return "Вопрос длиннее 1000 знаков — сократите его."
+        if code == "context_length_exceeded":
+            return f"Вопрос длиннее окна модели: {сообщение}"
+        return f"Ошибка сервиса: {код or ''} {code}".strip()
+
+    async def _есть_место(self) -> bool:
+        try:
+            о = (await self.сервис.здоровье()).get("queue") or {}
+        except httpx.HTTPError:
+            return False
+        return int(о.get("ждут") or 0) < int(о.get("мест_в_очереди") or 0)
+
+    async def _с_повторами(self, вывод: _Вывод, запрос: Callable[[], Awaitable[dict]], начало: float,
+                           учёт: dict) -> dict:
+        """429 — оба кода повторяемые, до общего срока СРОК_С.
+
+        queue_full: Retry-After сервиса — оценка «медиана недавних генераций × очередь», и она бывает
+        и мала (1,5 с при генерации ≈ 70 с), и велика (741 с при очереди, разобравшейся за полторы
+        минуты — нашёл check_telegram.py). Поэтому бот раз в ОПРОС_МЕСТА_С смотрит /health (вне лимита
+        ключа, модель не трогает) и повторяет, как только место освободилось, но не позже Retry-After.
+        rate_limited: пауза по Retry-After — она точная (ведро ключа)."""
+        ждали = 0.0                     # сумма пауз: срок считается и по ней, и по часам
+        while True:
+            итог = await запрос()
+            if итог.get("код") != 429:
+                return итог
+            повтор = float(итог.get("повтор_через") or 5.0)
+            прошло = max(self.часы() - начало, ждали)
+            if итог.get("код_ошибки") == "queue_full":
+                предел = min(повтор, СРОК_С - прошло)
+                if предел <= 0:
+                    итог["код_ошибки"] = "срок"
+                    return итог
+                учёт["повторов_429"] += 1
+                await вывод.правка("⏳ Очередь сервиса занята (queue_full) — повторю, как только освободится "
+                                   f"место (не позже чем через {_секунды(повтор)} с).", срочно=True)
+                ждали_места = 0.0
+                while ждали_места < предел:
+                    шаг = min(ОПРОС_МЕСТА_С, предел - ждали_места)
+                    await self.пауза(шаг)
+                    ждали_места += шаг
+                    if await self._есть_место():
+                        break
+                ждали += ждали_места
+            else:
+                if прошло + повтор > СРОК_С:
+                    итог["код_ошибки"] = "срок"
+                    return итог
+                учёт["повторов_429"] += 1
+                await вывод.правка(f"⏳ Сервис просит подождать ({итог.get('код_ошибки')}) — повторю через "
+                                   f"{_секунды(повтор)} с.", срочно=True)
+                await self.пауза(повтор)
+                ждали += повтор
+
+    # --- чат ------------------------------------------------------------------------------
+
+    async def _чат(self, чат: int, вопрос: str) -> None:
+        начало = self.часы()
+        вывод = _Вывод(self, чат)
+        await вывод.начать("⏳ …")
+        сообщения = self._история.get(чат, []) + [{"role": "user", "content": вопрос}]
+        учёт = {"повторов_429": 0, "укорочено": 0}
+        while True:
+            итог = await self._с_повторами(вывод, lambda: self.сервис.чат(сообщения, вывод.событие), начало, учёт)
+            if итог.get("код") == 413 and итог.get("код_ошибки") == "context_length_exceeded" and len(сообщения) > 2:
+                сообщения = сообщения[2:]
+                учёт["укорочено"] += 1
+                continue
+            break
+        всего = self.часы() - начало
+        if итог.get("код") == 200 and not итог.get("код_ошибки"):
+            подпись = (f"— {self.сервис.модель} · вход {итог['вход']} · ответ {итог['ответ']} токенов · "
+                       f"очередь {итог['ожидание']:.1f} с · всего {всего:.1f} с")
+            if итог.get("причина") == "length":
+                подпись += " · обрезано пределом ответа"
+            await вывод.закончить(f"{итог['текст']}\n\n{подпись}")
+            self._история[чат] = (сообщения + [{"role": "assistant", "content": итог["текст"]}])[-ИСТОРИЯ:]
+        elif итог.get("код") == 200:
+            await вывод.закончить(f"{итог['текст']}\n\n⚠ поток прервался: {итог['код_ошибки']}".lstrip())
+        elif итог.get("код_ошибки") == "срок":
+            await вывод.закончить("Очередь сервиса не освободилась за 20 минут — попробуйте позже.")
+        else:
+            await вывод.закончить(self._текст_отказа(итог))
+        self._записать(кто="владелец", вид="чат", код=итог.get("код"), ошибка=итог.get("код_ошибки") or "",
+                       вход=итог.get("вход"), ответ=итог.get("ответ"), ожидание_с=round(итог.get("ожидание") or 0, 1),
+                       длительность_с=round(всего, 1), правок=вывод.правок,
+                       отказов_telegram=вывод.отказов_telegram, **учёт)
+
+    # --- документы (D-T10) ----------------------------------------------------------------
+
+    async def _документы(self, чат: int, вопрос: str) -> None:
+        начало = self.часы()
+        вывод = _Вывод(self, чат)
+        await вывод.начать("⏳ Ищу в документах и отвечаю на этой машине — на CPU это 1–5 минут.",
+                           ход=lambda с: f"⏳ Ищу в документах и отвечаю… {с:.0f} с")
+        учёт = {"повторов_429": 0}
+        итог = await self._с_повторами(вывод, lambda: self.сервис.документы(вопрос), начало, учёт)
+        всего = self.часы() - начало
+        скрыто: dict[str, int] = {}
+        if итог.get("код") == 200:
+            текст, скрыто = собрать_документы(итог["данные"], итог["ожидание"], всего, self.сервис.модель)
+        elif итог.get("код_ошибки") == "срок":
+            текст = "Очередь сервиса не освободилась за 20 минут — попробуйте позже."
+        else:
+            текст = self._текст_отказа(итог)
+        await вывод.закончить(текст)
+        usage = ((итог.get("данные") or {}).get("usage") or {})
+        self._записать(кто="владелец", вид="документы", код=итог.get("код"), ошибка=итог.get("код_ошибки") or "",
+                       вход=usage.get("prompt_tokens"), ответ=usage.get("completion_tokens"),
+                       ожидание_с=round(итог.get("ожидание") or 0, 1), длительность_с=round(всего, 1),
+                       правок=вывод.правок, отказов_telegram=вывод.отказов_telegram,
+                       скрыто=sum(скрыто.values()), виды_пд=sorted(скрыто), **учёт)
+
+    # --- опрос (D-T03) --------------------------------------------------------------------
+
+    def _offset(self) -> int | None:
+        try:
+            with open(os.path.join(self.каталог, OFFSET), encoding="utf-8") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _сохранить_offset(self, offset: int) -> None:
+        _записать_атомарно(os.path.join(self.каталог, OFFSET), f"{offset}\n")
+
+    async def познакомиться(self) -> dict:
+        я = await self.api.getMe()
+        self.имя = "@" + str(я.get("username") or "")
+        return я
+
+    async def опросить_раз(self) -> int:
+        """Один цикл getUpdates: обновления — в работу, offset — на диск, состояние — для /admin."""
+        offset = self._offset()
+        обновления = await self.api.getUpdates(offset)
+        self.опросов += 1
+        self.ошибок_сети_подряд = 0
+        self.последний_опрос = time.strftime("%Y-%m-%dT%H:%M:%S")
+        for о in обновления:
+            self._сохранить_offset(int(о["update_id"]) + 1)
+            await self.обработать(о)
+        self.записать_состояние()
+        return len(обновления)
+
+    async def опрашивать(self, стоп: asyncio.Event) -> None:
+        """Опрос до остановки. Сеть или 5xx Telegram — пауза 2 → 4 → … → 60 с; 401 и 409 — выход."""
+        пауза = 2.0
+        while not стоп.is_set():
+            try:
+                await self.опросить_раз()
+                пауза = 2.0
+            except ОшибкаTelegram as exc:
+                if exc.код in (401, 404, 409):
+                    raise
+                await self._сбой(f"Telegram {exc.код}", пауза)
+                пауза = min(пауза * 2, 60.0)
+            except httpx.HTTPError as exc:
+                await self._сбой(type(exc).__name__, пауза)
+                пауза = min(пауза * 2, 60.0)
+
+    async def _сбой(self, что: str, пауза: float) -> None:
+        self.ошибок_сети_подряд += 1
+        self.последняя_ошибка = f"{time.strftime('%H:%M:%S')} {без_токена(что)}"
+        self.события["сбой сети"] += 1
+        self.записать_состояние()
+        await self.пауза(пауза)
+
+    # --- журнал и состояние (D-T12) -------------------------------------------------------
+
+    def _записать(self, **поля: Any) -> None:
+        self.события[поля.get("кто", "?")] += 1
+        self.журнал.записать(**{к: в for к, в in поля.items() if в is not None})
+
+    def записать_состояние(self) -> None:
+        состояние = {"pid": os.getpid(), "бот": self.имя, "владелец_задан": self.владелец is not None,
+                     "сервис": self.сервис.адрес, "api": urlparse(self.api.база).hostname,
+                     "последний_опрос": self.последний_опрос, "опросов": self.опросов,
+                     "ошибок_сети_подряд": self.ошибок_сети_подряд, "последняя_ошибка": self.последняя_ошибка,
+                     "события": dict(self.события), "сеть": self.сеть() if self.сеть else None,
+                     "обновлено": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        _записать_атомарно(os.path.join(self.каталог, СОСТОЯНИЕ), json.dumps(состояние, ensure_ascii=False, indent=1))
+
+    async def закрыть(self) -> None:
+        for задача in self._работники.values():
+            задача.cancel()
+        await self.api.закрыть()
+        await self.сервис.закрыть()
+
+
+def собрать_документы(д: dict, ожидание: float, всего: float, модель: str) -> tuple[str, dict[str, int]]:
+    """Ответ по документам для Telegram: текст, источники, цитаты, подпись — каждая часть под маской ПД,
+    затем контрольная проверка всего текста (D-T10)."""
+    скрыто: Counter = Counter()
+
+    def маска(текст: str) -> tuple[str, bool]:
+        чисто, виды = pd.скрыть(текст)
+        скрыто.update(виды)
+        return чисто, bool(виды)
+
+    if д.get("abstain"):
+        части = ["Не знаю: в документах ответа не нашлось."]
+        if д.get("clarification"):
+            части.append(маска(str(д["clarification"]))[0])
+    else:
+        части = [маска(str(д.get("answer") or ""))[0]]
+    источники = д.get("sources") or []
+    if источники:
+        части.append("Источники:\n" + "\n".join(
+            маска(f"[{и.get('n')}] {и.get('source')}" + (f" · {и.get('section')}" if и.get("section") else ""))[0]
+            for и in источники))
+    цитаты = []
+    for ц in д.get("quotes") or []:
+        текст, было = маска(str(ц.get("text") or ""))
+        отметка = f"✓ {ц.get('check') or 'подтверждена'}" if ц.get("confirmed") else "✗ не подтверждена"
+        цитаты.append(f"[{ц.get('n')}] «{текст}» — {отметка}" + (" (сокращена фильтром ПД)" if было else ""))
+    if цитаты:
+        части.append("Цитаты:\n" + "\n".join(цитаты))
+    usage = д.get("usage") or {}
+    части.append(f"— {модель} · по документам · вход {usage.get('prompt_tokens')} · ответ "
+                 f"{usage.get('completion_tokens')} · очередь {ожидание:.1f} с · всего {всего:.1f} с")
+    if скрыто:
+        части.append(f"Скрыто фильтром ПД: {sum(скрыто.values())} ({', '.join(sorted(скрыто))}). "
+                     f"Фильтр не ловит: {pd.НЕ_ЛОВИТ}.")
+    else:
+        части.append(f"Фильтр ПД ничего не нашёл. Он не ловит: {pd.НЕ_ЛОВИТ}.")
+    if not pd.список_есть():
+        части.append("⚠ Список фамилий не найден — фамилии не проверялись.")
+    итог = "\n\n".join(ч for ч in части if ч)
+    if pd.найти(итог):
+        return "Ответ скрыт: фильтр ПД нашёл в готовом тексте то, что не смог скрыть.", dict(скрыто)
+    return итог, dict(скрыто)
+
+
+def _записать_атомарно(путь: str, текст: str) -> None:
+    временный = путь + ".tmp"
+    with open(временный, "w", encoding="utf-8") as f:
+        f.write(текст)
+    os.replace(временный, путь)
