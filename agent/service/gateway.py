@@ -1,7 +1,8 @@
 """Шлюз приватного сервиса Дня 30 (spec FR-01…FR-17, plan D-01…D-18).
 
-Порядок проверок у каждого запроса: подсеть клиента → ключ и права → лимит
-ключа (ручки /v1/*) → размер тела и входа в токенах (до вызова модели) →
+Порядок проверок у каждого запроса: подсеть клиента → заявленный размер тела →
+ключ и права → лимит ключа (ручки /v1/*) → фактический размер тела и входа в токенах
+(до вызова модели) →
 очередь (одна генерация за раз, ждут ≤ N). Всё, что не прошло, — ошибка в
 формате OpenAI, текст по-русски. Модель — одна (`loc-rag-docs`); в Ollama
 шлюз ходит так же, как агент: /api/chat, think: false, keep_alive, окно и предел.
@@ -14,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -23,6 +26,7 @@ from typing import Any, AsyncIterator, Callable
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from agent.service.config import КОРЕНЬ, Настройки
 from agent.service.journal import Журнал
@@ -47,9 +51,80 @@ def _текст(содержимое: Any) -> str | None:
     if isinstance(содержимое, str):
         return содержимое
     if isinstance(содержимое, list):
-        части = [ч.get("text", "") for ч in содержимое if isinstance(ч, dict) and ч.get("type") == "text"]
-        return "".join(части) if len(части) == len(содержимое) else None
+        части = []
+        for ч in содержимое:
+            if not isinstance(ч, dict) or ч.get("type") != "text" or not isinstance(ч.get("text"), str):
+                return None
+            части.append(ч["text"])
+        return "".join(части)
     return None
+
+
+async def _json_объект(request: Request, предел: int) -> dict[str, Any] | JSONResponse:
+    """Read at most ``предел`` bytes, then parse a JSON object."""
+    def неконечная_константа(значение: str) -> None:
+        raise ValueError(f"Недопустимая JSON-константа: {значение}")
+
+    тело = bytearray()
+    прочитано = 0
+    try:
+        async for кусок in request.stream():
+            прочитано += len(кусок)
+            if прочитано > предел:
+                request.state.журнал["ошибка"] = "request_too_large"
+                return ошибка(413, f"Тело запроса больше предела {предел} байт.",
+                              "invalid_request_error", "request_too_large")
+            тело.extend(кусок)
+    except ClientDisconnect:
+        return ошибка(400, "Тело запроса передано не полностью.", "invalid_request_error",
+                      "incomplete_request")
+    try:
+        данные = json.loads(тело, parse_constant=неконечная_константа)
+    except (UnicodeError, ValueError, RecursionError):
+        return ошибка(400, "Тело запроса — не JSON.", "invalid_request_error", "invalid_json")
+    if not isinstance(данные, dict):
+        return ошибка(400, "Тело JSON должно быть объектом.", "invalid_request_error",
+                      "invalid_request_body")
+    def есть_суррогат(значение: Any) -> bool:
+        стек = [значение]
+        while стек:
+            текущее = стек.pop()
+            if isinstance(текущее, str) and any(0xD800 <= ord(с) <= 0xDFFF for с in текущее):
+                return True
+            if isinstance(текущее, list):
+                стек.extend(текущее)
+            elif isinstance(текущее, dict):
+                стек.extend(текущее.keys())
+                стек.extend(текущее.values())
+        return False
+    if есть_суррогат(данные):
+        return ошибка(400, "JSON содержит недопустимый Unicode.", "invalid_request_error", "invalid_json")
+    return данные
+
+
+def _целое(значение: Any) -> int | None:
+    """An integer or the integer string accepted by the previous gateway."""
+    if isinstance(значение, bool):
+        return None
+    if isinstance(значение, int):
+        return значение
+    if isinstance(значение, str) and re.fullmatch(r"[+-]?\d+", значение.strip()):
+        try:
+            return int(значение)
+        except ValueError:
+            return None
+    return None
+
+
+def _число(значение: Any) -> float | None:
+    """A finite JSON number; numeric strings remain backwards compatible."""
+    if isinstance(значение, bool) or not isinstance(значение, (int, float, str)):
+        return None
+    try:
+        число = float(значение)
+    except (OverflowError, ValueError):
+        return None
+    return число if math.isfinite(число) else None
 
 
 class Сервис:
@@ -165,9 +240,14 @@ def создать_приложение(с: Сервис) -> FastAPI:
             return ошибка(403, f"Адрес {адрес} не входит в разрешённые подсети сервиса.", "permission_error",
                           "forbidden_network")
         размер = request.headers.get("content-length")
-        if размер and размер.isdigit() and int(размер) > л.тело_байт:
+        цифры = (размер or "").lstrip("0") or "0"
+        предел_строкой = str(л.тело_байт)
+        заявлено_больше = bool(размер and размер.isdigit() and
+                                (len(цифры) > len(предел_строкой) or
+                                 len(цифры) == len(предел_строкой) and цифры > предел_строкой))
+        if заявлено_больше:
             с.журнал.записать(адрес=адрес, ручка=request.url.path, код=413, ошибка="request_too_large")
-            return ошибка(413, f"Тело запроса {int(размер)} байт больше предела {л.тело_байт}.",
+            return ошибка(413, f"Заявленное тело запроса больше предела {л.тело_байт} байт.",
                           "invalid_request_error", "request_too_large")
         request.state.ключ = ""
         request.state.журнал = {}
@@ -211,16 +291,25 @@ def создать_приложение(с: Сервис) -> FastAPI:
             return запись
         if (отказ := с.лимит(request, запись)) is not None:
             return отказ
-        try:
-            тело = await request.json()
-        except ValueError:
-            return ошибка(400, "Тело запроса — не JSON.", "invalid_request_error", "invalid_json")
-        модель = тело.get("model") or с.настройки.модель
+        тело = await _json_объект(request, л.тело_байт)
+        if isinstance(тело, JSONResponse):
+            return тело
+        модель = тело.get("model")
+        if модель is None or модель == "":
+            модель = с.настройки.модель
+        if not isinstance(модель, str):
+            return ошибка(400, "model — непустая строка.", "invalid_request_error", "invalid_model")
         if модель != с.настройки.модель:
             return ошибка(404, f"Модели «{модель}» нет. Есть одна: {с.настройки.модель}.", "invalid_request_error",
                           "model_not_found")
+        if тело.get("stream") is not None and not isinstance(тело["stream"], bool):
+            return ошибка(400, "stream — true или false.", "invalid_request_error", "invalid_stream")
+        сырые_сообщения = тело.get("messages")
+        if not isinstance(сырые_сообщения, list):
+            return ошибка(400, "messages — список {role: system|user|assistant, content: текст}.",
+                          "invalid_request_error", "invalid_messages")
         сообщения = []
-        for м in тело.get("messages") or []:
+        for м in сырые_сообщения:
             текст = _текст(м.get("content")) if isinstance(м, dict) else None
             if not isinstance(м, dict) or м.get("role") not in РОЛИ or текст is None:
                 return ошибка(400, "messages — список {role: system|user|assistant, content: текст}.",
@@ -236,19 +325,24 @@ def создать_приложение(с: Сервис) -> FastAPI:
                                f"{л.ответ_токенов} − запас). Сократите историю или текст.",
                           "invalid_request_error", "context_length_exceeded",
                           {"X-Prompt-Tokens": str(вход), "X-Prompt-Tokens-Limit": str(л.вход_токенов)})
-        просили = тело.get("max_tokens") or тело.get("max_completion_tokens") or л.ответ_токенов
-        try:
-            просили = int(просили)
-        except (TypeError, ValueError):
-            return ошибка(400, "max_tokens — целое число.", "invalid_request_error", "invalid_max_tokens")
+        for имя in ("max_tokens", "max_completion_tokens"):
+            if тело.get(имя) is not None and _целое(тело[имя]) is None:
+                return ошибка(400, f"{имя} — целое число.", "invalid_request_error",
+                              "invalid_max_tokens")
+        просили = _целое(тело.get("max_tokens") or тело.get("max_completion_tokens") or
+                          л.ответ_токенов)
+        if просили is None:  # защита от некорректного лимита в конфигурации
+            return ошибка(400, "max_tokens — целое число.", "invalid_request_error",
+                          "invalid_max_tokens")
         предел = max(1, min(просили, л.ответ_токенов))
         заголовки = {"X-Prompt-Tokens": str(вход)}
         if просили > л.ответ_токенов:
             заголовки["X-Max-Tokens-Clamped"] = f"{просили}->{л.ответ_токенов}"
-        try:
-            температура = min(2.0, max(0.0, float(тело.get("temperature", 0))))
-        except (TypeError, ValueError):
-            температура = 0.0
+        температура = _число(тело.get("temperature") if тело.get("temperature") is not None else 0)
+        if температура is None:
+            return ошибка(400, "temperature — конечное число.", "invalid_request_error",
+                          "invalid_temperature")
+        температура = min(2.0, max(0.0, температура))
         позиция = с.очередь.позиция()
         try:
             заявка = с.очередь.записаться()          # место — сразу, до любого await (гонка при всплеске)
@@ -375,11 +469,12 @@ def создать_приложение(с: Сервис) -> FastAPI:
             return запись
         if (отказ := с.лимит(request, запись)) is not None:
             return отказ
-        try:
-            тело = await request.json()
-        except ValueError:
-            return ошибка(400, "Тело запроса — не JSON.", "invalid_request_error", "invalid_json")
-        вопрос = str(тело.get("question") or "").strip()
+        тело = await _json_объект(request, л.тело_байт)
+        if isinstance(тело, JSONResponse):
+            return тело
+        if тело.get("question") is not None and not isinstance(тело["question"], str):
+            return ошибка(400, "question — строка.", "invalid_request_error", "invalid_question")
+        вопрос = (тело.get("question") or "").strip()
         if not вопрос:
             return ошибка(400, "Пустой question.", "invalid_request_error", "empty_question")
         if len(вопрос) > л.вопрос_символов:
@@ -442,19 +537,39 @@ def создать_приложение(с: Сервис) -> FastAPI:
         запись = с.ключ(request, "админ")
         if isinstance(запись, JSONResponse):
             return запись
-        тело = await request.json()
+        тело = await _json_объект(request, л.тело_байт)
+        if isinstance(тело, JSONResponse):
+            return тело
+        событие, ступень_значение = тело.get("событие"), тело.get("ступень")
+        if событие not in ("начало", "конец") or isinstance(ступень_значение, bool) or not isinstance(
+                ступень_значение, (str, int)) or not str(ступень_значение).strip():
+            return ошибка(400, "Нужны событие «начало» или «конец» и непустая ступень.",
+                          "invalid_request_error", "invalid_step")
         if с.шаг is None:
             return {"ok": False}
-        return await asyncio.to_thread(с.шаг, str(тело.get("событие", "")), str(тело.get("ступень", "")))
+        return await asyncio.to_thread(с.шаг, событие, str(ступень_значение))
 
     @app.post("/admin/api/load")
     async def нагрузка(request: Request):
         запись = с.ключ(request, "админ")
         if isinstance(запись, JSONResponse):
             return запись
+        тело = await _json_объект(request, л.тело_байт)
+        if isinstance(тело, JSONResponse):
+            return тело
+        if "ступени" in тело:
+            ступени = тело["ступени"]
+            if not isinstance(ступени, list) or not ступени or any(
+                    _целое(з) is None or _целое(з) <= 0 for з in ступени):
+                return ошибка(400, "ступени — непустой список положительных целых чисел.",
+                              "invalid_request_error", "invalid_load")
+        for имя, минимум in (("клиенты", 1), ("вопросов", 1), ("документы", 0), ("max_tokens", 1)):
+            if имя in тело and (_целое(тело[имя]) is None or _целое(тело[имя]) < минимум):
+                return ошибка(400, f"{имя} — целое число не меньше {минимум}.",
+                              "invalid_request_error", "invalid_load")
         if с.нагрузка is None:
             return ошибка(503, "Нагрузка с этой страницы недоступна.", "server_error", "load_disabled")
-        итог = await asyncio.to_thread(с.нагрузка, await request.json())
+        итог = await asyncio.to_thread(с.нагрузка, тело)
         return JSONResponse(итог, status_code=409 if итог.get("error") else 200)
 
     @app.post("/admin/api/telegram")
@@ -462,10 +577,13 @@ def создать_приложение(с: Сервис) -> FastAPI:
         запись = с.ключ(request, "админ")
         if isinstance(запись, JSONResponse):
             return запись
-        try:
-            действие = str((await request.json()).get("действие") or "")
-        except ValueError:
-            действие = ""
+        тело = await _json_объект(request, л.тело_байт)
+        if isinstance(тело, JSONResponse):
+            return тело
+        действие = тело.get("действие")
+        if not isinstance(действие, str):
+            return ошибка(400, "Действие — строка: старт, стоп или перезапуск.",
+                          "invalid_request_error", "bad_action")
         if действие not in ("старт", "стоп", "перезапуск"):
             return ошибка(400, "Действие — старт, стоп или перезапуск.", "invalid_request_error", "bad_action")
         if с.телеграм is None:
