@@ -14228,7 +14228,7 @@ class БотTelegram(unittest.IsolatedAsyncioTestCase):
         self.номер_обновления = 0
 
     def бот(self, владелец=ВЛАДЕЛЕЦ, правка_с=0.0):
-        api = svc_tg.BotAPI("123:TESTTOKEN", база="https://tg.test", transport=httpx.MockTransport(self.tg))
+        api = svc_tg.BotAPI("123:TESTTOKEN", база="http://127.0.0.1:18080", transport=httpx.MockTransport(self.tg))
         сервис = svc_tg.КлиентСервиса("https://svc.test", "sk-day30-test", transport=httpx.MockTransport(self.сервис))
 
         async def пауза(секунд):
@@ -14529,7 +14529,7 @@ class БотTelegram(unittest.IsolatedAsyncioTestCase):
                 await отпустить.wait()
             return прежний(запрос)
         self.сервис.чат.append(_sse("долгий ответ"))
-        api = svc_tg.BotAPI("123:TESTTOKEN", база="https://tg.test", transport=httpx.MockTransport(self.tg))
+        api = svc_tg.BotAPI("123:TESTTOKEN", база="http://127.0.0.1:18080", transport=httpx.MockTransport(self.tg))
         сервис = svc_tg.КлиентСервиса("https://svc.test", "sk-day30-test", transport=httpx.MockTransport(медленный))
 
         async def пауза(секунд):

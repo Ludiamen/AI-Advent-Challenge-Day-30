@@ -70,16 +70,23 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     владелец = int(с["TELEGRAM_OWNER_ID"]) if с["TELEGRAM_OWNER_ID"].strip().lstrip("-").isdigit() else None
 
-    from agent.service import config
     from agent.service import telegram as tg
-    настройки = config.загрузить()
-    данные = config.каталог_данных()
-    api_база = (а.api or с["TELEGRAM_API_BASE"] or tg.API_TELEGRAM).rstrip("/")
+    try:
+        api_база = tg.проверить_api_telegram(а.api or с["TELEGRAM_API_BASE"] or tg.API_TELEGRAM)
+    except ValueError:
+        лог.error("Небезопасный адрес Telegram Bot API: разрешены официальный HTTPS API и loopback для тестов")
+        return 2
     хост_api = urlparse(api_база).hostname or ""
     if not _петля(хост_api):
-        os.environ["OFFLINE_ALLOW_EXTERNAL"] = хост_api
+        os.environ["OFFLINE_ALLOW_EXTERNAL"] = "api.telegram.org"
+    else:
+        os.environ.pop("OFFLINE_ALLOW_EXTERNAL", None)
     from agent.local import offline
     offline.включить(True, "telegram_bot.py")
+
+    from agent.service import config
+    настройки = config.загрузить()
+    данные = config.каталог_данных()
 
     файл_ключа = os.path.join(данные, "telegram.key")
     try:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
@@ -27,7 +28,7 @@ import ssl
 import time
 from collections import Counter
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import httpx
 
@@ -35,6 +36,7 @@ from agent.service import pd
 from agent.service.journal import Журнал
 
 API_TELEGRAM = "https://api.telegram.org"
+ОТКАЗ_ПД = "Ответ скрыт: не удалось безопасно проверить персональные данные."
 ИСТОРИЯ = 12                 # реплик в памяти на чат (6 пар)
 ПРАВКА_С = 1.5               # правка сообщения не чаще (ворота 0, A-T2: 40 правок без 429)
 ПЕЧАТАЕТ_С = 4.0             # «печатает…» пока ждём
@@ -59,6 +61,75 @@ def без_токена(текст: str) -> str:
     return _ТОКЕН.sub("/bot…", текст or "")
 
 
+def проверить_api_telegram(база: str) -> str:
+    """Проверить адрес до передачи токена: официальный HTTPS либо корневой loopback для тестов."""
+    ошибка = ValueError("небезопасный адрес Telegram Bot API")
+    if (not isinstance(база, str) or not база or база != база.strip() or "?" in база or "#" in база or
+            any(ord(знак) < 32 or ord(знак) == 127 for знак in база)):
+        raise ошибка
+    try:
+        адрес = urlsplit(база)
+        хост, порт = адрес.hostname, адрес.port
+    except ValueError:
+        raise ошибка from None
+    if (not хост or адрес.netloc.endswith(":") or адрес.username is not None or адрес.password is not None or
+            адрес.query or адрес.fragment or адрес.path not in ("", "/")):
+        raise ошибка
+    хост = хост.lower()
+    if хост == "api.telegram.org":
+        if адрес.scheme != "https" or порт not in (None, 443):
+            raise ошибка
+        return API_TELEGRAM
+    локальный = хост == "localhost"
+    if not локальный:
+        try:
+            ip = ipaddress.ip_address(хост)
+            локальный = (ip.version == 4 and ip.is_loopback) or ip == ipaddress.ip_address("::1")
+        except ValueError:
+            локальный = False
+    if not локальный or адрес.scheme not in ("http", "https") or порт == 0:
+        raise ошибка
+    узел = f"[{хост}]" if ":" in хост else хост
+    return f"{адрес.scheme}://{узел}" + (f":{порт}" if порт is not None else "")
+
+
+_ДВОЙНИКИ_КОНТРОЛЬ = str.maketrans("ABCEHKMOPTXYaceopxy", "АВСЕНКМОРТХУасеорху")
+_БУКВЫ_КОНТРОЛЬ = "А-ЯЁа-яё"
+_ДЕФИСЫ_КОНТРОЛЬ = "-‐‑"
+_ОКОНЧАНИЯ_ОТЧЕСТВ = ("ович", "евич", "ьич", "овна", "евна", "ична", "инична")
+
+
+def _остатки_пд(текст: str) -> bool:
+    """Независимая защита после маски: простые лексические признаки без шаблонов ``pd.скрыть``."""
+    if not isinstance(текст, str):
+        return True
+    норм = текст.translate(_ДВОЙНИКИ_КОНТРОЛЬ)
+    if re.search(r"[^\s@]+@[^\s@]+\.[^\s@]+", норм):
+        return True
+    for начало in re.finditer(r"(?<!\d)(?:\+7|8)", норм):
+        окно = норм[начало.start():начало.start() + 32]
+        цифры = "".join(с for с in окно if с.isdecimal())
+        if len(цифры) >= 11:
+            return True
+    слова = re.findall(rf"[{_БУКВЫ_КОНТРОЛЬ}]+(?:[{_ДЕФИСЫ_КОНТРОЛЬ}][{_БУКВЫ_КОНТРОЛЬ}]+)*", норм)
+    основы = tuple(с.translate(_ДВОЙНИКИ_КОНТРОЛЬ).casefold() for с in pd.фамилии())
+    for слово in слова:
+        for часть in re.split(rf"[{_ДЕФИСЫ_КОНТРОЛЬ}]", слово):
+            нижнее = часть.casefold()
+            if any(нижнее.startswith(основа) for основа in основы):
+                return True
+            if any(нижнее.endswith(окончание) and len(нижнее) > len(окончание) + 1
+                   for окончание in _ОКОНЧАНИЯ_ОТЧЕСТВ):
+                return True
+    маска = re.escape(pd.МАСКА)
+    слово = rf"[{_БУКВЫ_КОНТРОЛЬ}]+"
+    дефис = rf"[{_ДЕФИСЫ_КОНТРОЛЬ}]"
+    if re.search(rf"(?:{слово}{дефис})+{маска}|{маска}(?:{дефис}{слово})+", норм):
+        return True
+    инициалы = r"(?:[А-ЯЁ]\.\s?[А-ЯЁ]\.?|[А-ЯЁ]\.?\s[А-ЯЁ]\.)"
+    return bool(re.search(rf"{инициалы}\s*{маска}|{маска}\s*{инициалы}", норм))
+
+
 def _хэш(значение: Any) -> str:
     return hashlib.sha256(str(значение).encode()).hexdigest()[:8]
 
@@ -77,10 +148,12 @@ class BotAPI:
     """Шесть методов Bot API на httpx (D-T02): токен — только в пути запроса."""
 
     def __init__(self, токен: str, база: str = API_TELEGRAM, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        база = проверить_api_telegram(база)
         self._токен = токен
-        self.база = база.rstrip("/")
+        self.база = база
         self._http = httpx.AsyncClient(base_url=self.база, transport=transport,
-                                       timeout=httpx.Timeout(ОПРОС_С + 15, connect=10))
+                                       timeout=httpx.Timeout(ОПРОС_С + 15, connect=10),
+                                       follow_redirects=False, trust_env=False)
 
     async def вызвать(self, метод: str, **поля: Any) -> Any:
         тело = {к: в for к, в in поля.items() if в is not None}
@@ -667,36 +740,71 @@ class Бот:
 
 
 def собрать_документы(д: dict, ожидание: float, всего: float, модель: str) -> tuple[str, dict[str, int]]:
+    """Собрать ответ только если все его части удалось отфильтровать и проверить."""
+    try:
+        return _собрать_документы(д, ожидание, всего, модель)
+    except Exception:  # noqa: BLE001 — при любой ошибке исходный документ не должен уйти в Telegram
+        return ОТКАЗ_ПД, {}
+
+
+def _собрать_документы(д: dict, ожидание: float, всего: float, модель: str) -> tuple[str, dict[str, int]]:
     """Ответ по документам для Telegram: текст, источники, цитаты, подпись — каждая часть под маской ПД,
     затем контрольная проверка всего текста (D-T10)."""
+    if not isinstance(д, dict):
+        raise TypeError("ответ по документам должен быть объектом")
     скрыто: Counter = Counter()
+
+    def поле(значение: Any) -> str:
+        if значение is None:
+            return ""
+        if not isinstance(значение, (str, int, float, bool)):
+            raise TypeError("поле ответа по документам должно быть скаляром")
+        return str(значение)
 
     def маска(текст: str) -> tuple[str, bool]:
         чисто, виды = pd.скрыть(текст)
+        if pd.найти(чисто) or _остатки_пд(чисто):
+            raise ValueError("после маскирования остались признаки ПД")
         скрыто.update(виды)
         return чисто, bool(виды)
 
+    if "abstain" in д and not isinstance(д["abstain"], bool):
+        raise TypeError("abstain должен быть логическим")
     if д.get("abstain"):
         части = ["Не знаю: в документах ответа не нашлось."]
         if д.get("clarification"):
-            части.append(маска(str(д["clarification"]))[0])
+            части.append(маска(поле(д["clarification"]))[0])
     else:
-        части = [маска(str(д.get("answer") or ""))[0]]
+        части = [маска(поле(д.get("answer") or ""))[0]]
     источники = д.get("sources") or []
+    if not isinstance(источники, list):
+        raise TypeError("sources должен быть списком")
     if источники:
-        части.append("Источники:\n" + "\n".join(
-            маска(f"[{и.get('n')}] {и.get('source')}" + (f" · {и.get('section')}" if и.get("section") else ""))[0]
-            for и in источники))
+        строки = []
+        for и in источники:
+            if not isinstance(и, dict):
+                raise TypeError("элемент sources должен быть объектом")
+            номер, источник, раздел = поле(и.get("n")), поле(и.get("source")), поле(и.get("section"))
+            строки.append(маска(f"[{номер}] {источник}" + (f" · {раздел}" if раздел else ""))[0])
+        части.append("Источники:\n" + "\n".join(строки))
     цитаты = []
-    for ц in д.get("quotes") or []:
-        текст, было = маска(str(ц.get("text") or ""))
-        отметка = f"✓ {ц.get('check') or 'подтверждена'}" if ц.get("confirmed") else "✗ не подтверждена"
-        цитаты.append(f"[{ц.get('n')}] «{текст}» — {отметка}" + (" (сокращена фильтром ПД)" if было else ""))
+    цитаты_ответа = д.get("quotes") or []
+    if not isinstance(цитаты_ответа, list):
+        raise TypeError("quotes должен быть списком")
+    for ц in цитаты_ответа:
+        if not isinstance(ц, dict) or not isinstance(ц.get("confirmed"), bool):
+            raise TypeError("элемент quotes имеет неверный тип")
+        отметка = f"✓ {поле(ц.get('check') or 'подтверждена')}" if ц["confirmed"] else "✗ не подтверждена"
+        строка, было = маска(f"[{поле(ц.get('n'))}] «{поле(ц.get('text') or '')}» — {отметка}")
+        цитаты.append(строка + (" (сокращена фильтром ПД)" if было else ""))
     if цитаты:
         части.append("Цитаты:\n" + "\n".join(цитаты))
     usage = д.get("usage") or {}
-    части.append(f"— {модель} · по документам · вход {usage.get('prompt_tokens')} · ответ "
-                 f"{usage.get('completion_tokens')} · очередь {ожидание:.1f} с · всего {всего:.1f} с")
+    if not isinstance(usage, dict):
+        raise TypeError("usage должен быть объектом")
+    вход, ответ = поле(usage.get("prompt_tokens")), поле(usage.get("completion_tokens"))
+    части.append(f"— {модель} · по документам · вход {вход or None} · ответ "
+                 f"{ответ or None} · очередь {ожидание:.1f} с · всего {всего:.1f} с")
     if скрыто:
         части.append(f"Скрыто фильтром ПД: {sum(скрыто.values())} ({', '.join(sorted(скрыто))}). "
                      f"Фильтр не ловит: {pd.НЕ_ЛОВИТ}.")
@@ -705,8 +813,8 @@ def собрать_документы(д: dict, ожидание: float, все�
     if not pd.список_есть():
         части.append("⚠ Список фамилий не найден — фамилии не проверялись.")
     итог = "\n\n".join(ч for ч in части if ч)
-    if pd.найти(итог):
-        return "Ответ скрыт: фильтр ПД нашёл в готовом тексте то, что не смог скрыть.", dict(скрыто)
+    if pd.найти(итог) or _остатки_пд(итог):
+        raise ValueError("контрольная проверка нашла признаки ПД")
     return итог, dict(скрыто)
 
 

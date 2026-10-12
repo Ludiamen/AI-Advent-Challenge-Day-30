@@ -275,9 +275,13 @@ def кто_писал() -> list[dict[str, Any]]:
     с = секреты_бота()
     if not с["TELEGRAM_BOT_TOKEN"]:
         raise RuntimeError("нет TELEGRAM_BOT_TOKEN в .env")
-    база = (с["TELEGRAM_API_BASE"] or telegram.API_TELEGRAM).rstrip("/")
     try:
-        ответ = httpx.post(f"{база}/bot{с['TELEGRAM_BOT_TOKEN']}/getUpdates", json={"timeout": 0}, timeout=30).json()
+        база = telegram.проверить_api_telegram(с["TELEGRAM_API_BASE"] or telegram.API_TELEGRAM)
+    except ValueError:
+        raise RuntimeError("небезопасный адрес Telegram Bot API") from None
+    try:
+        ответ = httpx.post(f"{база}/bot{с['TELEGRAM_BOT_TOKEN']}/getUpdates", json={"timeout": 0}, timeout=30,
+                           follow_redirects=False, trust_env=False).json()
     except (httpx.HTTPError, ValueError) as exc:
         raise RuntimeError(telegram.без_токена(f"Bot API: {type(exc).__name__}: {exc}")) from None
     if not ответ.get("ok"):
