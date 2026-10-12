@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Тесты модели памяти. По умолчанию без сети.
+"""Тесты модели памяти и компонентов проекта.
 
-    python tests.py              — все тесты без обращений к API
-    python tests.py --живые      — плюс проверки, которым нужен реальный ключ
-    python tests.py -v           — подробный вывод
+    .venv/bin/python -B run_tests.py  — безопасный запуск всех пяти модулей
+    python tests.py --живые           — намеренно включает проверки внешнего API
 
-Сетевых вызовов в основном наборе нет намеренно: правила маршрутизации, границы
-слоёв и проверка инвариантов — это код, и он должен проверяться без оглядки на
-доступность провайдера и на лимиты бесплатного тарифа.
+Прямой запуск этого файла не включает отдельные регрессии HTTP и Telegram и не
+изолирует настоящий .env. Обычный runner работает во временном снимке, блокирует
+внешнюю сеть и допускает только локальные подменные сервисы. Флаг ``--живые`` в
+runner запрещён и остаётся отдельным осознанным действием.
 """
 
 from __future__ import annotations
@@ -3319,6 +3319,9 @@ class СбоиMCP(unittest.TestCase):
         класс = type("З", (_Заглушка,), {"статус": статус})
         сервер = _HTTPСервер(("127.0.0.1", 0), класс)
         _threading.Thread(target=сервер.serve_forever, daemon=True).start()
+        # Cleanup выполняется в обратном порядке: остановить цикл, затем
+        # закрыть listening socket, чтобы ResourceWarning не скрывал утечки.
+        self.addCleanup(сервер.server_close)
         self.addCleanup(сервер.shutdown)
         return f"http://127.0.0.1:{сервер.server_address[1]}/mcp"
 
@@ -3568,6 +3571,8 @@ def _трекер_клиент(каталог: str, **поля):
 
     поля.setdefault("данные", os.path.join(каталог, "tracker-data.json"))
     поля.setdefault("сброс", True)
+    поля.setdefault("токен", "mock-token")
+    поля.setdefault("орг", "mock-org")
     return tracker_api.создать(**поля)
 
 
@@ -3633,6 +3638,21 @@ class МокТрекера(unittest.TestCase):
         ответ = self.клиент.get("/v3/myself")
         self.assertEqual(ответ.status_code, 401)
         self.assertIn("Unauthorized", ответ.get_json()["errorMessages"])
+
+    def test_фикстура_не_зависит_от_tracker_env_и_сохраняет_401(self):
+        каталог = tempfile.mkdtemp(prefix="трекер-окружение-")
+        self.addCleanup(shutil.rmtree, каталог, True)
+        with mock.patch.dict(os.environ, {
+                "TRACKER_MOCK_TOKEN": "hostile-environment-token",
+                "TRACKER_MOCK_ORG": "hostile-environment-org",
+        }):
+            клиент = _трекер_клиент(каталог).test_client()
+        верный = клиент.get("/v3/myself", headers={
+            "Authorization": "OAuth mock-token", "X-Cloud-Org-ID": "mock-org"})
+        неверный = клиент.get("/v3/myself", headers={
+            "Authorization": "OAuth hostile-environment-token", "X-Cloud-Org-ID": "mock-org"})
+        self.assertEqual(верный.status_code, 200)
+        self.assertEqual(неверный.status_code, 401)
 
     def test_чужая_организация_403(self):
         ответ = self.клиент.get("/v3/myself", headers={
@@ -7016,37 +7036,131 @@ class ПланФлоу(unittest.TestCase):
         self.assertEqual(план.шаги[0].сервер, "deepwiki")
 
 
+class БезопасныйЗапускТестов(unittest.TestCase):
+    """run_tests.py не наследует секреты и не переносит локальный .env."""
+
+    def setUp(self):
+        self.корень = pathlib.Path(tempfile.mkdtemp(prefix="runner-fixture-"))
+        self.addCleanup(shutil.rmtree, self.корень, True)
+
+    def git(self, *аргументы):
+        import run_tests
+        return _subprocess.run(
+            ["git", *аргументы], cwd=self.корень, check=True,
+            env=run_tests._окружение_git(),
+            stdout=_subprocess.PIPE, stderr=_subprocess.PIPE,
+        )
+
+    def test_окружение_только_разрешённое_и_синтетическое(self):
+        import run_tests
+        временный = self.корень / "state"
+        with mock.patch.dict(os.environ, {
+                "UNLISTED_SENTINEL": "must-not-inherit",
+                "ALTERNATE_PROVIDER_CREDENTIAL": "must-not-inherit",
+                "EXAMPLE_API_KEY": "must-not-inherit",
+        }):
+            окружение = run_tests._окружение(временный, self.корень / "guard")
+        for имя in ("UNLISTED_SENTINEL", "ALTERNATE_PROVIDER_CREDENTIAL", "EXAMPLE_API_KEY"):
+            self.assertNotIn(имя, окружение)
+        self.assertEqual(окружение["HF_HUB_OFFLINE"], "1")
+        self.assertEqual(окружение["TMPDIR"], str(временный / "tmp"))
+        self.assertEqual(окружение["TRACKER_MOCK_TOKEN"], "synthetic-mock-token")
+
+    def test_снимок_исключает_env_и_дочерний_процесс_его_не_читает(self):
+        import run_tests
+        self.git("init", "-q")
+        probe = self.корень / "probe.py"
+        probe.write_text(
+            "import os\nfrom dotenv import load_dotenv\nload_dotenv()\n"
+            "print(os.environ.get('DAY30_SECRET_SENTINEL', 'missing'))\n",
+            encoding="utf-8")
+        (self.корень / ".env").write_text(
+            "DAY30_SECRET_SENTINEL=must-not-copy\n", encoding="utf-8")
+        (self.корень / ".env.example").write_text(
+            "DAY30_EXAMPLE=synthetic\n", encoding="utf-8")
+        self.git("add", "probe.py", ".env.example")
+
+        снимок = self.корень / "snapshot"
+        снимок.mkdir()
+        run_tests._копировать(self.корень, снимок)
+        self.assertNotIn("must-not-copy", (снимок / ".env").read_text(encoding="utf-8"))
+        self.assertTrue((снимок / ".env.example").is_file())
+
+        состояние = self.корень / "state"
+        запуск = _subprocess.run(
+            [sys.executable, "-B", "probe.py"], cwd=снимок,
+            env=run_tests._окружение(состояние, self.корень / "guard"),
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(запуск.stdout.strip(), "missing")
+
+    def test_сетевой_guard_передаётся_потомку_с_явным_env(self):
+        import run_tests
+        guard = self.корень / "guard"
+        guard.mkdir()
+        (guard / "sitecustomize.py").write_text(run_tests._ПРЕДОХРАНИТЕЛЬ, encoding="utf-8")
+        parent = self.корень / "parent.py"
+        parent.write_text(
+            "import os, subprocess, sys\n"
+            "code = '''import os, socket\n"
+            "print(os.environ.get(\"DAY30_TEST_GUARD\", \"missing\"))\n"
+            "try:\n    socket.getaddrinfo(\"198.51.100.1\", 443)\n"
+            "except OSError:\n    print(\"blocked\")\n"
+            "else:\n    print(\"unblocked\")\n'''\n"
+            "env = {\"PATH\": os.environ[\"PATH\"], \"PYTHONIOENCODING\": \"utf-8\"}\n"
+            "done = subprocess.run([sys.executable, \"-B\", \"-c\", code], env=env, "
+            "capture_output=True, text=True, check=True)\n"
+            "print(done.stdout, end=\"\")\n",
+            encoding="utf-8")
+        запуск = _subprocess.run(
+            [sys.executable, "-B", str(parent)],
+            env=run_tests._окружение(self.корень / "state", guard),
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(запуск.stdout.splitlines(), ["1", "blocked"])
+
+    def test_ссылка_на_неотслеживаемый_env_отклонена_до_копирования(self):
+        import run_tests
+        self.git("init", "-q")
+        (self.корень / ".env").write_text("SYNTHETIC_ONLY=value\n", encoding="utf-8")
+        (self.корень / "settings.txt").symlink_to(".env")
+        self.git("add", "settings.txt")
+        снимок = self.корень / "snapshot"
+        снимок.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "ссылки запрещены"):
+            run_tests._копировать(self.корень, снимок)
+        self.assertEqual(list(снимок.iterdir()), [])
+
+    def test_ровно_пять_модулей_а_живой_режим_отклонён(self):
+        import contextlib
+        import io
+        import run_tests
+        self.assertEqual(run_tests.МОДУЛИ, (
+            "tests", "test_gateway_validation", "test_telegram_offset",
+            "test_telegram_reliability", "test_telegram_security",
+        ))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ошибка:
+            run_tests._аргументы(["--живые"])
+        self.assertEqual(ошибка.exception.code, 2)
+
+
 class МаршрутСерверов(unittest.TestCase):
     """Какие серверы поднимать под запрос: модель, правила и фильтры."""
 
     def серверы(self):
-        # Готовность github зависит от GITHUB_TOKEN, а .env читается при каждой
-        # загрузке и главнее окружения. Стоило токену появиться на машине — и
-        # проверки «неготовый сервер отсеивается» переставали значить то, что в
-        # них написано. Поэтому файл серверов читается из отдельного каталога с
-        # копией .env без этой переменной: остальные значения остаются как есть.
-        #
-        # Настоящий трекер («tracker-real») — наоборот: правила «по просьбе» и
-        # «замещает» проверяются на нём, а готов он только с TRACKER_TOKEN и
-        # TRACKER_ORG. В свежем клоне без .env сервер отсеивался как неготовый,
-        # и три теста падали не из-за маршрута, а из-за чужих секретов. Тесты к
-        # трекеру не подключаются, поэтому здесь всегда заглушки.
+        # Готовность серверов должна определяться только фикстурой. Настоящий
+        # .env намеренно не читается и не копируется: github выключен пустым
+        # значением, а tracker-real получает синтетические реквизиты.
         каталог = tempfile.mkdtemp(prefix="маршрут-серверы-")
         shutil.copy(os.path.join(КОРЕНЬ_ДНЯ, "mcp-servers.json"), каталог)
-        свой = os.path.join(КОРЕНЬ_ДНЯ, ".env")
-        лишние = ("GITHUB_TOKEN", "TRACKER_TOKEN", "TRACKER_ORG")
-        строки = [с for с in (pathlib.Path(свой).read_text(encoding="utf-8").splitlines()
-                              if os.path.exists(свой) else [])
-                  if not с.strip().startswith(лишние)]
-        строки += ["TRACKER_TOKEN=заглушка-для-тестов", "TRACKER_ORG=заглушка-для-тестов"]
         pathlib.Path(os.path.join(каталог, ".env")).write_text(
-            "\n".join(строки), encoding="utf-8")
-        прежний = os.environ.pop("GITHUB_TOKEN", None)
+            "TRACKER_TOKEN=synthetic-test-token\n"
+            "TRACKER_ORG=synthetic-test-org\n",
+            encoding="utf-8")
         try:
-            return amcp.load(os.path.join(каталог, "mcp-servers.json"))
+            with mock.patch.dict(os.environ, {"GITHUB_TOKEN": ""}):
+                return amcp.load(os.path.join(каталог, "mcp-servers.json"))
         finally:
-            if прежний is not None:
-                os.environ["GITHUB_TOKEN"] = прежний
             shutil.rmtree(каталог, ignore_errors=True)
 
     def маршрутизатор(self, *ответы):
