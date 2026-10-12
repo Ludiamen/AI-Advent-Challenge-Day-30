@@ -15,6 +15,8 @@ from fastapi.testclient import TestClient
 
 from agent.service import config, gateway, journal, keys
 
+МАРКЕРЫ = ("PRIVATE_TEST_PATH_12345", "PRIVATE_TEST_TOKEN_67890")
+
 
 class _Tokenizer:
     def вход(self, сообщения):
@@ -57,6 +59,12 @@ class ВалидацияШлюза(unittest.TestCase):
     @staticmethod
     def _h(ключ):
         return {"Authorization": f"Bearer {ключ}", "Content-Type": "application/json"}
+
+    def _без_маркеров(self, response):
+        клиентские_данные = response.text + "\n" + "\n".join(
+            f"{имя}: {значение}" for имя, значение in response.headers.items())
+        for маркер in МАРКЕРЫ:
+            self.assertNotIn(маркер, клиентские_данные)
 
     async def _raw(self, method, path, chunks, headers=(), client=("192.168.1.31", 50000), complete=True):
         """Invoke ASGI directly and expose how many request chunks were pulled."""
@@ -274,6 +282,109 @@ class ВалидацияШлюза(unittest.TestCase):
                                            "max_tokens": "200", "extra": True})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self.вызовы_нагрузки[-1]["extra"], True)
+
+    def test_исключение_rag_не_раскрывает_внутренние_данные(self):
+        успешный = self.клиент.post("/v1/documents/answer", headers=self._h(self.ключ_док),
+                                    json={"question": "успешный синтетический вопрос"})
+        self.assertEqual((успешный.status_code, успешный.json()["answer"]), (200, "ok"))
+
+        вызовы = []
+
+        def сломанный_rag(вопрос):
+            вызовы.append(вопрос)
+            raise RuntimeError(f"{МАРКЕРЫ[0]} {МАРКЕРЫ[1]}")
+
+        self.сервис.отвечатель = сломанный_rag
+        отказ = self.клиент.post("/v1/documents/answer", headers=self._h(self.ключ_чат),
+                                 json={"question": "не должен дойти"})
+        self.assertEqual((отказ.status_code, отказ.json()["error"]["code"]), (403, "permission_denied"))
+        self.assertEqual(вызовы, [], "отказ по праву не вызывает RAG")
+
+        r = self.клиент.post("/v1/documents/answer", headers=self._h(self.ключ_док),
+                             json={"question": "контролируемый сбой"})
+        self.assertEqual((r.status_code, r.json()["error"]), (502, {
+            "message": gateway.СООБЩЕНИЕ_ДОКУМЕНТЫ_НЕДОСТУПНЫ,
+            "type": "server_error",
+            "code": "documents_error",
+        }))
+        self.assertEqual(вызовы, ["контролируемый сбой"], "после исключения RAG не повторяется")
+        self._без_маркеров(r)
+
+    def test_ошибки_ollama_безопасны_в_json_и_sse(self):
+        успешный = self.клиент.post("/v1/chat/completions", headers=self._h(self.ключ_чат), json={
+            "messages": [{"role": "user", "content": "успешный синтетический вопрос"}]})
+        self.assertEqual((успешный.status_code, успешный.json()["choices"][0]["message"]["content"]),
+                         (200, "ok"))
+
+        вызовы = []
+
+        async def сломанная_ollama(request):
+            вызовы.append(json.loads(request.content))
+            raise httpx.ConnectError(f"{МАРКЕРЫ[0]} {МАРКЕРЫ[1]}", request=request)
+
+        self.сервис.ollama = httpx.AsyncClient(
+            base_url="http://ollama", transport=httpx.MockTransport(сломанная_ollama))
+
+        отказ = self.клиент.post("/v1/chat/completions", headers=self._h(self.ключ_док), json={
+            "messages": [{"role": "user", "content": "не должен дойти"}]})
+        self.assertEqual((отказ.status_code, отказ.json()["error"]["code"]), (403, "permission_denied"))
+        self.assertEqual(вызовы, [], "отказ по праву не вызывает Ollama")
+
+        обычный = self.клиент.post("/v1/chat/completions", headers=self._h(self.ключ_чат), json={
+            "messages": [{"role": "user", "content": "контролируемый сбой JSON"}]})
+        self.assertEqual((обычный.status_code, обычный.json()["error"]), (502, {
+            "message": gateway.СООБЩЕНИЕ_OLLAMA_НЕДОСТУПНА,
+            "type": "server_error",
+            "code": "upstream_error",
+        }))
+        self.assertEqual(len(вызовы), 1, "обычный запрос к Ollama не повторяется")
+        self._без_маркеров(обычный)
+
+        with self.клиент.stream("POST", "/v1/chat/completions", headers=self._h(self.ключ_чат), json={
+                "stream": True,
+                "messages": [{"role": "user", "content": "контролируемый сбой SSE"}]}) as поток:
+            тело = "".join(поток.iter_text())
+        self.assertEqual(поток.status_code, 200, "после начала SSE HTTP-статус изменить нельзя")
+        события = [json.loads(строка[6:]) for строка in тело.splitlines() if строка.startswith("data: {")]
+        ошибки = [событие["error"] for событие in события if "error" in событие]
+        self.assertEqual(ошибки, [{
+            "message": gateway.СООБЩЕНИЕ_OLLAMA_НЕДОСТУПНА,
+            "type": "server_error",
+            "code": "upstream_error",
+        }])
+        self.assertEqual(len(вызовы), 2, "потоковый запрос к Ollama не повторяется")
+        клиентские_данные = тело + "\n" + "\n".join(
+            f"{имя}: {значение}" for имя, значение in поток.headers.items())
+        for маркер in МАРКЕРЫ:
+            self.assertNotIn(маркер, клиентские_данные)
+
+    def test_исключение_telegram_не_раскрывает_внутренние_данные(self):
+        успешный = self.клиент.post("/admin/api/telegram", headers=self._h(self.ключ_админ),
+                                    json={"действие": "старт"})
+        self.assertEqual((успешный.status_code, успешный.json(), self.вызовы_телеграм),
+                         (200, {"ok": True}, ["старт"]))
+
+        вызовы = []
+
+        def сломанный_telegram(действие):
+            вызовы.append(действие)
+            raise RuntimeError(f"{МАРКЕРЫ[0]} {МАРКЕРЫ[1]}")
+
+        self.сервис.телеграм = сломанный_telegram
+        отказ = self.клиент.post("/admin/api/telegram", headers=self._h(self.ключ_чат),
+                                 json={"действие": "стоп"})
+        self.assertEqual((отказ.status_code, отказ.json()["error"]["code"]), (403, "permission_denied"))
+        self.assertEqual(вызовы, [], "отказ по праву не вызывает обработчик Telegram")
+
+        r = self.клиент.post("/admin/api/telegram", headers=self._h(self.ключ_админ),
+                             json={"действие": "перезапуск"})
+        self.assertEqual((r.status_code, r.json()["error"]), (409, {
+            "message": gateway.СООБЩЕНИЕ_TELEGRAM_НЕДОСТУПЕН,
+            "type": "server_error",
+            "code": "telegram_error",
+        }))
+        self.assertEqual(вызовы, ["перезапуск"], "после исключения обработчик Telegram не повторяется")
+        self._без_маркеров(r)
 
 
 if __name__ == "__main__":

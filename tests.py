@@ -7051,6 +7051,17 @@ class БезопасныйЗапускТестов(unittest.TestCase):
             stdout=_subprocess.PIPE, stderr=_subprocess.PIPE,
         )
 
+    def под_guard(self, код: str, таймаут: int = 10):
+        import run_tests
+        guard = self.корень / "guard"
+        guard.mkdir()
+        (guard / "sitecustomize.py").write_text(run_tests._ПРЕДОХРАНИТЕЛЬ, encoding="utf-8")
+        return _subprocess.run(
+            [sys.executable, "-B", "-c", код],
+            env=run_tests._окружение(self.корень / "state", guard),
+            capture_output=True, text=True, timeout=таймаут,
+        )
+
     def test_окружение_только_разрешённое_и_синтетическое(self):
         import run_tests
         временный = self.корень / "state"
@@ -7106,7 +7117,17 @@ class БезопасныйЗапускТестов(unittest.TestCase):
             "print(os.environ.get(\"DAY30_TEST_GUARD\", \"missing\"))\n"
             "try:\n    socket.getaddrinfo(\"198.51.100.1\", 443)\n"
             "except OSError:\n    print(\"blocked\")\n"
-            "else:\n    print(\"unblocked\")\n'''\n"
+            "else:\n    print(\"unblocked\")\n"
+            "for address in ((\"127.0.0.1\", 11434), (\"127.0.0.1\", 54321)):\n"
+            "    try:\n        socket.socket().connect(address)\n"
+            "    except OSError:\n        print(\"blocked-local\")\n"
+            "    else:\n        print(\"unblocked-local\")\n"
+            "listener = socket.socket()\n"
+            "listener.bind((\"127.0.0.1\", 0)); listener.listen()\n"
+            "client = socket.create_connection(listener.getsockname())\n"
+            "accepted, _ = listener.accept()\n"
+            "client.close(); accepted.close(); listener.close()\n"
+            "print(\"allowed-test-listener\")\n'''\n"
             "env = {\"PATH\": os.environ[\"PATH\"], \"PYTHONIOENCODING\": \"utf-8\"}\n"
             "done = subprocess.run([sys.executable, \"-B\", \"-c\", code], env=env, "
             "capture_output=True, text=True, check=True)\n"
@@ -7117,7 +7138,191 @@ class БезопасныйЗапускТестов(unittest.TestCase):
             env=run_tests._окружение(self.корень / "state", guard),
             capture_output=True, text=True, check=True,
         )
-        self.assertEqual(запуск.stdout.splitlines(), ["1", "blocked"])
+        self.assertEqual(запуск.stdout.splitlines(), [
+            "1", "blocked", "blocked-local", "blocked-local", "allowed-test-listener",
+        ])
+
+    def test_сетевой_guard_не_ломает_socketpair_и_testclient(self):
+        import run_tests
+        guard = self.корень / "guard"
+        guard.mkdir()
+        (guard / "sitecustomize.py").write_text(run_tests._ПРЕДОХРАНИТЕЛЬ, encoding="utf-8")
+        probe = self.корень / "testclient_probe.py"
+        probe.write_text(
+            "import socket\n"
+            "from fastapi import FastAPI\n"
+            "from fastapi.testclient import TestClient\n"
+            "a, b = socket.socketpair()\n"
+            "a.sendall(b'x')\n"
+            "assert b.recv(1) == b'x'\n"
+            "a.close(); b.close()\n"
+            "app = FastAPI()\n"
+            "@app.get('/')\n"
+            "async def root(): return {'ok': True}\n"
+            "response = TestClient(app).get('/')\n"
+            "assert response.status_code == 200 and response.json() == {'ok': True}\n",
+            encoding="utf-8")
+        запуск = _subprocess.run(
+            [sys.executable, "-B", str(probe)],
+            env=run_tests._окружение(self.корень / "state", guard),
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual((запуск.returncode, запуск.stdout, запуск.stderr), (0, "", ""))
+
+    def test_сетевой_guard_разделяет_family_type_protocol_и_адрес(self):
+        запуск = self.под_guard(r'''
+import socket
+
+def запрещён(sock, address):
+    try:
+        sock.connect(address)
+    except OSError as exc:
+        assert "запрещ" in str(exc).lower(), exc
+    else:
+        raise AssertionError(f"соединение неожиданно разрешено: {address}")
+    finally:
+        sock.close()
+
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp.bind(("127.0.0.1", 0))
+udp_port = udp.getsockname()[1]
+запрещён(socket.socket(socket.AF_INET, socket.SOCK_STREAM), ("127.0.0.1", udp_port))
+udp.close()
+
+alias = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+alias.bind(("127.0.0.2", 0))
+alias.listen()
+alias_port = alias.getsockname()[1]
+запрещён(socket.socket(socket.AF_INET, socket.SOCK_STREAM), ("127.0.0.1", alias_port))
+запрещён(socket.socket(socket.AF_INET6, socket.SOCK_STREAM), ("::1", alias_port))
+alias.close()
+print("endpoint-isolation-ok")
+''')
+        self.assertEqual((запуск.returncode, запуск.stdout, запуск.stderr),
+                         (0, "endpoint-isolation-ok\n", ""))
+
+    def test_сетевой_guard_проверяет_bind_и_жизненный_цикл_listener(self):
+        запуск = self.под_guard(r'''
+import socket
+import sitecustomize
+import subprocess
+import sys
+
+def запрещён(sock, address):
+    try:
+        sock.connect(address)
+    except OSError as exc:
+        assert "запрещ" in str(exc).lower(), exc
+    else:
+        raise AssertionError(f"соединение неожиданно разрешено: {address}")
+    finally:
+        sock.close()
+
+настоящий_bind = sitecustomize._настоящий_bind
+вызовы = []
+def отмеченный_bind(*args, **kwargs):
+    вызовы.append((args, kwargs))
+    return настоящий_bind(*args, **kwargs)
+sitecustomize._настоящий_bind = отмеченный_bind
+try:
+    for address in (("0.0.0.0", 0), ("192.0.2.10", 0)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(address)
+        except OSError:
+            pass
+        else:
+            raise AssertionError(f"bind неожиданно разрешён: {address}")
+        finally:
+            sock.close()
+    sock6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        sock6.bind(("::", 0))
+    except OSError:
+        pass
+    else:
+        raise AssertionError("IPv6 wildcard bind неожиданно разрешён")
+    finally:
+        sock6.close()
+finally:
+    sitecustomize._настоящий_bind = настоящий_bind
+assert вызовы == [], вызовы
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.bind(("127.0.0.1", 0))
+listener.listen()
+endpoint = listener.getsockname()
+client = socket.create_connection(endpoint, timeout=1)
+accepted, _ = listener.accept()
+client.close()
+accepted.close()
+listener.close()
+запрещён(socket.socket(socket.AF_INET, socket.SOCK_STREAM), endpoint)
+
+server_code = r"""
+import socket
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.bind(("127.0.0.1", 0))
+listener.listen()
+print(listener.getsockname()[1], flush=True)
+connection, _ = listener.accept()
+connection.close()
+listener.close()
+"""
+child = subprocess.Popen(
+    [sys.executable, "-B", "-c", server_code],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+child_endpoint = ("127.0.0.1", int(child.stdout.readline().strip()))
+child_client = socket.create_connection(child_endpoint, timeout=1)
+child_client.close()
+_, child_stderr = child.communicate(timeout=3)
+assert child.returncode == 0, child_stderr
+запрещён(socket.socket(socket.AF_INET, socket.SOCK_STREAM), child_endpoint)
+
+failed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def сбой_bind(*args, **kwargs):
+    raise OSError("synthetic bind failure")
+sitecustomize._настоящий_bind = сбой_bind
+try:
+    try:
+        failed.bind(("127.0.0.1", 49152))
+    except OSError as exc:
+        assert "synthetic bind failure" in str(exc)
+    else:
+        raise AssertionError("неуспешный bind неожиданно удался")
+finally:
+    sitecustomize._настоящий_bind = настоящий_bind
+assert failed not in sitecustomize._связанные
+failed.close()
+запрещён(socket.socket(socket.AF_INET, socket.SOCK_STREAM), ("127.0.0.1", 49152))
+
+for port in (8443, 11434, 11435, 11436):
+    запрещён(socket.socket(socket.AF_INET, socket.SOCK_STREAM), ("127.0.0.1", port))
+запрещён(socket.socket(socket.AF_INET, socket.SOCK_STREAM), ("198.51.100.10", 443))
+try:
+    socket.getaddrinfo("example.invalid", 443)
+except OSError as exc:
+    assert "dns" in str(exc).lower(), exc
+else:
+    raise AssertionError("внешний DNS неожиданно разрешён")
+print("bind-lifecycle-ok")
+''')
+        self.assertEqual((запуск.returncode, запуск.stdout, запуск.stderr),
+                         (0, "bind-lifecycle-ok\n", ""))
+
+    def test_снимок_копирует_разрешённый_неотслеживаемый_security_тест(self):
+        import run_tests
+        self.git("init", "-q")
+        новый = self.корень / "test_service_journal_security.py"
+        новый.write_text("SYNTHETIC_TEST = True\n", encoding="utf-8")
+        снимок = self.корень / "snapshot"
+        снимок.mkdir()
+        run_tests._копировать(self.корень, снимок)
+        self.assertEqual(
+            (снимок / "test_service_journal_security.py").read_text(encoding="utf-8"),
+            "SYNTHETIC_TEST = True\n",
+        )
 
     def test_ссылка_на_неотслеживаемый_env_отклонена_до_копирования(self):
         import run_tests
@@ -7131,12 +7336,12 @@ class БезопасныйЗапускТестов(unittest.TestCase):
             run_tests._копировать(self.корень, снимок)
         self.assertEqual(list(снимок.iterdir()), [])
 
-    def test_ровно_пять_модулей_а_живой_режим_отклонён(self):
+    def test_ровно_шесть_модулей_а_живой_режим_отклонён(self):
         import contextlib
         import io
         import run_tests
         self.assertEqual(run_tests.МОДУЛИ, (
-            "tests", "test_gateway_validation", "test_telegram_offset",
+            "tests", "test_gateway_validation", "test_service_journal_security", "test_telegram_offset",
             "test_telegram_reliability", "test_telegram_security",
         ))
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ошибка:

@@ -35,6 +35,9 @@ from agent.service.limits import Ведро, Очередь, ОчередьПо�
 from agent.service.tokens import Токенизатор
 
 РОЛИ = ("system", "user", "assistant")
+СООБЩЕНИЕ_OLLAMA_НЕДОСТУПНА = "Локальная модель временно недоступна."
+СООБЩЕНИЕ_ДОКУМЕНТЫ_НЕДОСТУПНЫ = "Ответ по документам временно недоступен."
+СООБЩЕНИЕ_TELEGRAM_НЕДОСТУПЕН = "Операция Telegram временно недоступна."
 
 
 class КлиентУшёл(Exception):
@@ -379,9 +382,9 @@ def создать_приложение(с: Сервис) -> FastAPI:
         except asyncio.TimeoutError:
             request.state.журнал["ошибка"] = "timeout"
             return ошибка(504, f"Генерация дольше {int(л.таймаут_с)} с.", "server_error", "timeout")
-        except httpx.HTTPError as exc:
+        except httpx.HTTPError:
             request.state.журнал["ошибка"] = "ollama_error"
-            return ошибка(502, f"Ollama не ответила: {exc}", "server_error", "upstream_error")
+            return ошибка(502, СООБЩЕНИЕ_OLLAMA_НЕДОСТУПНА, "server_error", "upstream_error")
         finally:
             с.очередь.выйти(time.monotonic() - начало)
         заголовки["X-Queue-Wait"] = f"{ожидание:.1f}"
@@ -454,9 +457,9 @@ def создать_приложение(с: Сервис) -> FastAPI:
             вход_в_очередь.cancel()
             код, ошибка_кода = 499, "client_gone"
             raise
-        except httpx.HTTPError as exc:
+        except httpx.HTTPError:
             код, ошибка_кода = 502, "ollama_error"
-            yield "data: " + json.dumps({"error": {"message": f"Ollama не ответила: {exc}", "type": "server_error",
+            yield "data: " + json.dumps({"error": {"message": СООБЩЕНИЕ_OLLAMA_НЕДОСТУПНА, "type": "server_error",
                                                    "code": "upstream_error"}}, ensure_ascii=False) + "\n\n"
         finally:
             с.журнал.записать(**запись, код=код, ошибка=ошибка_кода, ожидание_с=round(ожидание, 2),
@@ -507,9 +510,9 @@ def создать_приложение(с: Сервис) -> FastAPI:
         except asyncio.TimeoutError:
             request.state.журнал["ошибка"] = "timeout"
             return ошибка(504, f"Ответ по документам дольше {int(л.таймаут_с)} с.", "server_error", "timeout")
-        except Exception as exc:  # noqa: BLE001 — ошибка отвечателя: клиенту — 502, а не обрыв
+        except Exception:  # noqa: BLE001 — ошибка отвечателя: клиенту — безопасный 502, а не обрыв
             request.state.журнал["ошибка"] = "documents_error"
-            return ошибка(502, f"Ответ по документам не получился: {exc}", "server_error", "documents_error")
+            return ошибка(502, СООБЩЕНИЕ_ДОКУМЕНТЫ_НЕДОСТУПНЫ, "server_error", "documents_error")
         request.state.журнал.update({"ожидание_с": round(ожидание, 2), "очередь": позиция,
                                      "вход": (итог.get("usage") or {}).get("prompt_tokens"),
                                      "ответ": (итог.get("usage") or {}).get("completion_tokens")})
@@ -590,8 +593,8 @@ def создать_приложение(с: Сервис) -> FastAPI:
             return ошибка(503, "Управление ботом с этой страницы недоступно.", "server_error", "telegram_disabled")
         try:
             итог = await asyncio.to_thread(с.телеграм, действие)
-        except (RuntimeError, ValueError, OSError) as exc:
-            return ошибка(409, str(exc), "server_error", "telegram_error")
+        except (RuntimeError, ValueError, OSError):
+            return ошибка(409, СООБЩЕНИЕ_TELEGRAM_НЕДОСТУПЕН, "server_error", "telegram_error")
         return JSONResponse(итог)
 
     return app
