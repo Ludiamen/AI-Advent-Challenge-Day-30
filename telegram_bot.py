@@ -110,33 +110,40 @@ def main(argv: list[str] | None = None) -> int:
                      tg.КлиентСервиса(адрес_сервиса, ключ, ca=ca if os.path.exists(ca) else None,
                                       модель=настройки.модель),
                      владелец=владелец, каталог=данные, сеть=сеть)
-        try:
-            я = await бот.познакомиться()
-        except tg.ОшибкаTelegram as exc:
-            лог.error("Bot API не принял токен: %s", exc)
-            await бот.закрыть()
-            return 2
-        лог.info("Бот %s · Bot API %s · сервис %s · владелец %s · группы %s", бот.имя, хост_api, адрес_сервиса,
-                 "задан" if владелец is not None else "НЕ задан — бот никому не отвечает",
-                 "разрешены" if я.get("can_join_groups") else "запрещены")
-        бот.записать_состояние()
         стоп = asyncio.Event()
-        опрос = asyncio.ensure_future(бот.опрашивать(стоп))
+        задача = asyncio.current_task()
         цикл = asyncio.get_running_loop()
-        for сигнал in (signal.SIGTERM, signal.SIGINT):
-            цикл.add_signal_handler(сигнал, lambda: (стоп.set(), опрос.cancel()))
+
+        def остановить() -> None:
+            стоп.set()
+            if задача is not None:
+                задача.cancel()
+
+        сигналы = (signal.SIGTERM, signal.SIGINT)
+        for сигнал in сигналы:
+            цикл.add_signal_handler(сигнал, остановить)
         код = 0
         try:
-            await опрос
+            я = await бот.познакомиться_с_повторами(стоп)
+            лог.info("Бот %s · Bot API %s · сервис %s · владелец %s · группы %s", бот.имя, хост_api,
+                     адрес_сервиса, "задан" if владелец is not None else "НЕ задан — бот никому не отвечает",
+                     "разрешены" if я.get("can_join_groups") else "запрещены")
+            бот.записать_состояние()
+            await бот.опрашивать(стоп)
         except asyncio.CancelledError:
             лог.info("Остановлен сигналом")
         except tg.ОшибкаTelegram as exc:
-            лог.error("Опрос остановлен: %s%s", exc,
+            лог.error("Bot API остановил бота: %s%s", exc,
                       " — бота уже опрашивает другой процесс" if exc.код == 409 else "")
             код = 3 if exc.код == 409 else 2
         finally:
-            бот.записать_состояние()
-            await бот.закрыть()
+            стоп.set()
+            for сигнал in сигналы:
+                цикл.remove_signal_handler(сигнал)
+            try:
+                бот.записать_состояние()
+            finally:
+                await бот.закрыть()
         return код
 
     return asyncio.run(работать())

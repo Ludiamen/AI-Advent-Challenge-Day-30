@@ -14366,7 +14366,7 @@ class БотTelegram(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Сервис не отвечает", весь)
         self.assertIn("ollama_error", весь)
         self.assertIn("поток прервался: timeout", итоги[-1])
-        self.assertTrue(итоги[-1].startswith("нача"), "начало ответа не теряется")
+        self.assertNotIn("нача", итоги[-1], "частичный ответ ошибочного потока не выдаётся за результат")
         await бот.закрыть()
 
     async def test_чужому_один_отказ_в_сутки_и_ни_одного_запроса_в_сервис(self):

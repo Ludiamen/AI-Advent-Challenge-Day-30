@@ -18,10 +18,12 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hashlib
 import html
 import ipaddress
 import json
+import math
 import os
 import re
 import ssl
@@ -144,6 +146,65 @@ class ОшибкаTelegram(Exception):
         self.код, self.описание, self.повтор = код, без_токена(описание), повтор
 
 
+class _ОшибкаSSE(ValueError):
+    """Поток сервиса нарушил согласованный формат OpenAI SSE."""
+
+
+async def _события_sse(r: httpx.Response):
+    """Разобрать SSE как UTF-8, включая фрагменты байтов и многострочные ``data``.
+
+    httpx декодирует ``aiter_lines`` с заменой битых символов. Для ответа модели это
+    опасно: повреждённый поток выглядел бы законченным текстом, поэтому декодер здесь
+    строгий. Неизвестные поля SSE разрешены стандартом и пропускаются.
+    """
+    декодер = codecs.getincrementaldecoder("utf-8")("strict")
+    буфер = ""
+    данные: list[str] = []
+
+    def строка(значение: str):
+        nonlocal данные
+        if значение == "":
+            if данные:
+                событие = "\n".join(данные)
+                данные = []
+                return "data", событие
+            return None
+        if значение.startswith(":"):
+            return "comment", значение[1:].lstrip(" ")
+        поле, разделитель, значение_поля = значение.partition(":")
+        if разделитель and значение_поля.startswith(" "):
+            значение_поля = значение_поля[1:]
+        if поле == "data":
+            данные.append(значение_поля if разделитель else "")
+        return None
+
+    try:
+        async for кусок in r.aiter_bytes():
+            буфер += декодер.decode(кусок)
+            while True:
+                конец = re.search(r"\r\n|\r|\n", буфер)
+                if not конец or (конец.group() == "\r" and конец.end() == len(буфер)):
+                    break
+                текущая, буфер = буфер[:конец.start()], буфер[конец.end():]
+                событие = строка(текущая)
+                if событие is not None:
+                    yield событие
+        буфер += декодер.decode(b"", final=True)
+    except UnicodeDecodeError:
+        raise _ОшибкаSSE("поток не является UTF-8") from None
+
+    # EOF завершает последнюю строку/событие по правилам SSE. Успех всё равно
+    # требует отдельного [DONE], поэтому оборванный поток ниже будет отклонён.
+    if буфер.endswith("\r"):
+        буфер = буфер[:-1]
+    событие = строка(буфер)
+    if событие is not None:
+        yield событие
+    событие = строка("")
+    if событие is not None:
+        yield событие
+
+
 class BotAPI:
     """Шесть методов Bot API на httpx (D-T02): токен — только в пути запроса."""
 
@@ -161,17 +222,33 @@ class BotAPI:
         try:
             д = r.json()
         except ValueError:
-            raise ОшибкаTelegram(r.status_code, f"ответ не JSON (HTTP {r.status_code})") from None
+            код = r.status_code if r.status_code >= 400 else 502
+            raise ОшибкаTelegram(код, f"ответ не JSON (HTTP {r.status_code})") from None
+        if not isinstance(д, dict):
+            код = r.status_code if r.status_code >= 400 else 502
+            raise ОшибкаTelegram(код, f"ответ неверного типа (HTTP {r.status_code})")
         if not д.get("ok"):
-            raise ОшибкаTelegram(int(д.get("error_code") or r.status_code), str(д.get("description") or ""),
-                                 (д.get("parameters") or {}).get("retry_after"))
+            запасной_код = r.status_code if r.status_code >= 400 else 502
+            try:
+                код = int(д.get("error_code") or запасной_код)
+            except (TypeError, ValueError, OverflowError):
+                код = запасной_код
+            параметры = д.get("parameters")
+            повтор = параметры.get("retry_after") if isinstance(параметры, dict) else None
+            raise ОшибкаTelegram(код, str(д.get("description") or ""), повтор)
         return д.get("result")
 
     async def getMe(self) -> dict:
-        return await self.вызвать("getMe")
+        результат = await self.вызвать("getMe")
+        if not isinstance(результат, dict):
+            raise ОшибкаTelegram(502, "поле result метода getMe неверного типа")
+        return результат
 
     async def getUpdates(self, offset: int | None, timeout: int = ОПРОС_С) -> list[dict]:
-        return await self.вызвать("getUpdates", offset=offset, timeout=timeout, allowed_updates=["message"])
+        результат = await self.вызвать("getUpdates", offset=offset, timeout=timeout, allowed_updates=["message"])
+        if not isinstance(результат, list):
+            raise ОшибкаTelegram(502, "поле result метода getUpdates неверного типа")
+        return результат
 
     async def sendMessage(self, чат: int, текст: str, разметка: bool = False) -> dict:
         return await self.вызвать("sendMessage", chat_id=чат, text=текст, parse_mode="HTML" if разметка else None)
@@ -221,34 +298,78 @@ class КлиентСервиса:
                     итог.update(self._отказ(r, await r.aread()))
                     return итог
                 итог["код"] = 200
-                async for строка in r.aiter_lines():
-                    if строка.startswith(":"):
-                        число = re.search(r"(\d+)\s*$", строка)
+                завершение: dict[str, Any] | None = None
+                готово = False
+                async for вид, данные in _события_sse(r):
+                    if вид == "comment":
+                        число = re.search(r"(\d+)\s*$", данные)
                         if число:
                             await при_событии("очередь", int(число.group(1)))
                         continue
-                    if not строка.startswith("data: "):
-                        continue
-                    данные = строка[6:]
                     if данные == "[DONE]":
+                        if завершение is None:
+                            raise _ОшибкаSSE("[DONE] до завершающего фрагмента")
+                        готово = True
                         break
-                    ч = json.loads(данные)
+                    try:
+                        ч = json.loads(данные)
+                    except (UnicodeError, ValueError, RecursionError):
+                        raise _ОшибкаSSE("data не является JSON") from None
+                    if not isinstance(ч, dict):
+                        raise _ОшибкаSSE("JSON-событие не является объектом")
                     if "error" in ч:
-                        итог["код_ошибки"] = ч["error"].get("code") or "error"
-                        итог["ошибка"] = str(ч["error"].get("message") or "")
+                        ошибка = ч["error"]
+                        if not isinstance(ошибка, dict):
+                            raise _ОшибкаSSE("поле error не является объектом")
+                        итог["код_ошибки"] = str(ошибка.get("code") or "error")
+                        итог["ошибка"] = str(ошибка.get("message") or "")
                         break
-                    выбор = (ч.get("choices") or [{}])[0]
-                    кусок = (выбор.get("delta") or {}).get("content") or ""
+                    if завершение is not None:
+                        raise _ОшибкаSSE("данные после завершающего фрагмента")
+                    варианты = ч.get("choices")
+                    if not isinstance(варианты, list) or not варианты or not isinstance(варианты[0], dict):
+                        raise _ОшибкаSSE("неверное поле choices")
+                    выбор = варианты[0]
+                    delta = выбор.get("delta")
+                    if not isinstance(delta, dict):
+                        raise _ОшибкаSSE("неверное поле delta")
+                    кусок = delta.get("content", "")
+                    if not isinstance(кусок, str):
+                        raise _ОшибкаSSE("content не является строкой")
                     if кусок:
                         итог["текст"] += кусок
                         await при_событии("текст", итог["текст"])
-                    if выбор.get("finish_reason"):
-                        итог["причина"] = выбор["finish_reason"]
-                        итог["вход"] = (ч.get("usage") or {}).get("prompt_tokens")
-                        итог["ответ"] = (ч.get("usage") or {}).get("completion_tokens")
-                        итог["ожидание"] = float(ч.get("x_queue_wait") or 0.0)
+                    причина = выбор.get("finish_reason")
+                    if причина is not None:
+                        if причина not in ("stop", "length"):
+                            raise _ОшибкаSSE("неверная причина завершения")
+                        usage = ч.get("usage")
+                        if not isinstance(usage, dict):
+                            raise _ОшибкаSSE("нет usage в завершающем фрагменте")
+                        вход, ответ = usage.get("prompt_tokens"), usage.get("completion_tokens")
+                        if (not isinstance(вход, int) or isinstance(вход, bool) or вход < 0 or
+                                not isinstance(ответ, int) or isinstance(ответ, bool) or ответ < 0):
+                            raise _ОшибкаSSE("неверное usage в завершающем фрагменте")
+                        ожидание = ч.get("x_queue_wait", 0.0)
+                        if (not isinstance(ожидание, (int, float)) or isinstance(ожидание, bool) or
+                                not math.isfinite(float(ожидание)) or ожидание < 0):
+                            raise _ОшибкаSSE("неверное x_queue_wait")
+                        завершение = {"причина": причина, "вход": вход, "ответ": ответ,
+                                      "ожидание": float(ожидание)}
+                if not итог["код_ошибки"]:
+                    if not готово:
+                        raise _ОшибкаSSE("EOF до [DONE]")
+                    итог.update(завершение or {})
+        except _ОшибкаSSE as exc:
+            итог.update({"причина": None, "вход": None, "ответ": None, "ожидание": 0.0,
+                         "код_ошибки": "invalid_sse", "ошибка": str(exc)})
         except httpx.HTTPError as exc:
-            итог.update({"код_ошибки": "сеть", "ошибка": без_токена(f"{type(exc).__name__}: {exc}")})
+            итог.update({"причина": None, "вход": None, "ответ": None, "ожидание": 0.0,
+                         "код_ошибки": "сеть", "ошибка": без_токена(f"{type(exc).__name__}: {exc}")})
+        if итог["код_ошибки"]:
+            # Части уже могли появиться в промежуточной правке Telegram, но ошибочный
+            # поток не становится результатом и не должен попасть в историю.
+            итог["текст"] = ""
         return итог
 
     async def документы(self, вопрос: str) -> dict[str, Any]:
@@ -344,9 +465,13 @@ class _Вывод:
                 прошлый_ход = time.monotonic()
                 await self.правка(ход(time.monotonic() - начало), срочно=True)
 
-    def хватит_ждать(self) -> None:
-        if self._ход and not self._ход.done():
-            self._ход.cancel()
+    async def хватит_ждать(self) -> None:
+        задача, self._ход = self._ход, None
+        if задача is None:
+            return
+        if not задача.done():
+            задача.cancel()
+        await asyncio.gather(задача, return_exceptions=True)
 
     async def правка(self, текст: str, срочно: bool = False, разметка: bool = False) -> None:
         текст = текст[:ДЛИНА + 50]
@@ -375,13 +500,13 @@ class _Вывод:
         if вид == "очередь":
             await self.правка(f"⏳ в очереди сервиса: впереди {значение}" if значение else "⏳ модель отвечает…")
         elif вид == "текст":
-            self.хватит_ждать()
+            await self.хватит_ждать()
             await self.правка(значение[:ДЛИНА] + " ▍")
 
     async def закончить(self, текст: str, разметка: bool = True) -> None:
         """Итог: первая часть — правкой заготовки, остальное — новыми сообщениями по ДЛИНА; разметка
         модели — HTML Telegram (не разобрал — простой текст)."""
-        self.хватит_ждать()
+        await self.хватит_ждать()
         части = [текст[i:i + ДЛИНА] for i in range(0, len(текст), ДЛИНА)] or [""]
         await self.правка(части[0], срочно=True, разметка=разметка)
         for часть in части[1:]:
@@ -613,13 +738,18 @@ class Бот:
         await вывод.начать("⏳ …")
         сообщения = self._история.get(чат, []) + [{"role": "user", "content": вопрос}]
         учёт = {"повторов_429": 0, "укорочено": 0}
-        while True:
-            итог = await self._с_повторами(вывод, lambda: self.сервис.чат(сообщения, вывод.событие), начало, учёт)
-            if итог.get("код") == 413 and итог.get("код_ошибки") == "context_length_exceeded" and len(сообщения) > 2:
-                сообщения = сообщения[2:]
-                учёт["укорочено"] += 1
-                continue
-            break
+        try:
+            while True:
+                итог = await self._с_повторами(вывод, lambda: self.сервис.чат(сообщения, вывод.событие), начало, учёт)
+                if (итог.get("код") == 413 and итог.get("код_ошибки") == "context_length_exceeded" and
+                        len(сообщения) > 2):
+                    сообщения = сообщения[2:]
+                    учёт["укорочено"] += 1
+                    continue
+                break
+        except BaseException:
+            await вывод.хватит_ждать()
+            raise
         всего = self.часы() - начало
         if итог.get("код") == 200 and not итог.get("код_ошибки"):
             подпись = (f"— {self.сервис.модель} · вход {итог['вход']} · ответ {итог['ответ']} токенов · "
@@ -647,7 +777,11 @@ class Бот:
         await вывод.начать("⏳ Ищу в документах и отвечаю на этой машине — на CPU это 1–5 минут.",
                            ход=lambda с: f"⏳ Ищу в документах и отвечаю… {с:.0f} с")
         учёт = {"повторов_429": 0}
-        итог = await self._с_повторами(вывод, lambda: self.сервис.документы(вопрос), начало, учёт)
+        try:
+            итог = await self._с_повторами(вывод, lambda: self.сервис.документы(вопрос), начало, учёт)
+        except BaseException:
+            await вывод.хватит_ждать()
+            raise
         всего = self.часы() - начало
         скрыто: dict[str, int] = {}
         if итог.get("код") == 200:
@@ -681,6 +815,58 @@ class Бот:
         self.имя = "@" + str(я.get("username") or "")
         return я
 
+    @staticmethod
+    def _задержка_telegram(exc: ОшибкаTelegram, пауза: float) -> float | None:
+        """Вернуть задержку временного отказа; ``None`` означает постоянный отказ.
+
+        Собственный exponential backoff ограничен 60 секундами. Положительный
+        ``retry_after`` Telegram — минимальный срок запрета и потому может быть дольше.
+        """
+        if exc.код == 429:
+            try:
+                повтор = float(exc.повтор)
+            except (TypeError, ValueError, OverflowError):
+                повтор = 0.0
+            if not math.isfinite(повтор) or повтор <= 0:
+                повтор = 0.0
+            return max(пауза, повтор)
+        if 500 <= exc.код < 600:
+            return пауза
+        return None
+
+    async def _пауза_до_стопа(self, стоп: asyncio.Event, секунд: float) -> bool:
+        """Подождать задержку с возможностью немедленной остановки процесса."""
+        if стоп.is_set():
+            return True
+        сон = asyncio.ensure_future(self.пауза(секунд))
+        остановка = asyncio.ensure_future(стоп.wait())
+        try:
+            готово, _ = await asyncio.wait({сон, остановка}, return_when=asyncio.FIRST_COMPLETED)
+            return остановка in готово and стоп.is_set()
+        finally:
+            for задача in (сон, остановка):
+                if not задача.done():
+                    задача.cancel()
+            await asyncio.gather(сон, остановка, return_exceptions=True)
+
+    async def познакомиться_с_повторами(self, стоп: asyncio.Event) -> dict:
+        """Проверить токен, переживая сеть, Telegram 5xx и 429 с backoff 2…60 с."""
+        пауза = 2.0
+        while not стоп.is_set():
+            try:
+                return await self.познакомиться()
+            except ОшибкаTelegram as exc:
+                задержка = self._задержка_telegram(exc, пауза)
+                if задержка is None:
+                    raise
+                остановлен = await self._сбой(f"Telegram {exc.код}", задержка, стоп)
+            except httpx.HTTPError as exc:
+                остановлен = await self._сбой(type(exc).__name__, пауза, стоп)
+            if остановлен:
+                raise asyncio.CancelledError
+            пауза = min(пауза * 2, 60.0)
+        raise asyncio.CancelledError
+
     async def опросить_раз(self) -> int:
         """Один цикл getUpdates: обновления — в работу, offset — на диск, состояние — для /admin."""
         offset = self._offset()
@@ -695,27 +881,30 @@ class Бот:
         return len(обновления)
 
     async def опрашивать(self, стоп: asyncio.Event) -> None:
-        """Опрос до остановки. Сеть или 5xx Telegram — пауза 2 → 4 → … → 60 с; 401 и 409 — выход."""
+        """Опрос до остановки. Сеть/5xx/429 повторяются; остальные 4xx завершают процесс."""
         пауза = 2.0
         while not стоп.is_set():
             try:
                 await self.опросить_раз()
                 пауза = 2.0
             except ОшибкаTelegram as exc:
-                if exc.код in (401, 404, 409):
+                задержка = self._задержка_telegram(exc, пауза)
+                if задержка is None:
                     raise
-                await self._сбой(f"Telegram {exc.код}", пауза)
+                if await self._сбой(f"Telegram {exc.код}", задержка, стоп):
+                    return
                 пауза = min(пауза * 2, 60.0)
             except httpx.HTTPError as exc:
-                await self._сбой(type(exc).__name__, пауза)
+                if await self._сбой(type(exc).__name__, пауза, стоп):
+                    return
                 пауза = min(пауза * 2, 60.0)
 
-    async def _сбой(self, что: str, пауза: float) -> None:
+    async def _сбой(self, что: str, пауза: float, стоп: asyncio.Event) -> bool:
         self.ошибок_сети_подряд += 1
         self.последняя_ошибка = f"{time.strftime('%H:%M:%S')} {без_токена(что)}"
         self.события["сбой сети"] += 1
         self.записать_состояние()
-        await self.пауза(пауза)
+        return await self._пауза_до_стопа(стоп, пауза)
 
     # --- журнал и состояние (D-T12) -------------------------------------------------------
 
@@ -733,10 +922,15 @@ class Бот:
         _записать_атомарно(os.path.join(self.каталог, СОСТОЯНИЕ), json.dumps(состояние, ensure_ascii=False, indent=1))
 
     async def закрыть(self) -> None:
-        for задача in self._работники.values():
+        работники = list(self._работники.values())
+        for задача in работники:
             задача.cancel()
-        await self.api.закрыть()
-        await self.сервис.закрыть()
+        if работники:
+            await asyncio.gather(*работники, return_exceptions=True)
+        try:
+            await self.api.закрыть()
+        finally:
+            await self.сервис.закрыть()
 
 
 def собрать_документы(д: dict, ожидание: float, всего: float, модель: str) -> tuple[str, dict[str, int]]:
