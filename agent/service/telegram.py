@@ -27,6 +27,7 @@ import math
 import os
 import re
 import ssl
+import tempfile
 import time
 from collections import Counter
 from typing import Any, Awaitable, Callable
@@ -54,6 +55,7 @@ API_TELEGRAM = "https://api.telegram.org"
                 "длительность_с", "правок", "отказов_telegram", "повторов_429", "укорочено", "скрыто", "виды_пд")
 СОСТОЯНИЕ = "telegram-state.json"
 OFFSET = "telegram-offset"
+OFFSET_ПРЕДЫДУЩИЙ = "telegram-offset.pending"
 
 _ТОКЕН = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
 
@@ -148,6 +150,10 @@ class ОшибкаTelegram(Exception):
 
 class _ОшибкаSSE(ValueError):
     """Поток сервиса нарушил согласованный формат OpenAI SSE."""
+
+
+class ОшибкаCheckpoint(OSError):
+    """Offset нельзя безопасно прочитать или долговечно сохранить."""
 
 
 async def _события_sse(r: httpx.Response):
@@ -479,12 +485,19 @@ class _Вывод:
             return
         if not срочно and self.бот.часы() - self.момент < self.бот.правка_с:
             return
-        for _ in range(3 if срочно else 1):
+        отказов_429 = 0
+        while True:
             try:
                 await self.бот.api.editMessageText(self.чат, self.ид, в_html(текст) if разметка else текст, разметка)
             except ОшибкаTelegram as exc:
                 if exc.повтор:
                     self.отказов_telegram += 1
+                    отказов_429 += 1
+                    if not срочно:
+                        await self.бот.пауза(float(exc.повтор))
+                        return
+                    if отказов_429 >= 3:
+                        raise
                     await self.бот.пауза(float(exc.повтор))
                     continue
                 if разметка and exc.код == 400 and "parse" in exc.описание:
@@ -543,41 +556,81 @@ class Бот:
     # --- кто пишет --------------------------------------------------------------------
 
     async def обработать(self, обновление: dict) -> None:
+        """Совместимый путь: поставить обычный вопрос во внутреннюю очередь."""
+        await self._обработать(обновление, последовательно=False)
+
+    async def _обработать_до_конца(self, обновление: dict) -> None:
+        """Production polling: вернуть управление лишь после окончательной доставки ответа."""
+        await self._обработать(обновление, последовательно=True)
+
+    async def _обработать(self, обновление: dict, последовательно: bool) -> None:
+        if not isinstance(обновление, dict):
+            self._записать(кто="?", вид="update неверного типа")
+            return
         сообщение = обновление.get("message") or {}
-        if not сообщение:
+        if not isinstance(сообщение, dict) or not сообщение:
+            self._записать(кто="?", вид="update пропущен")
             return
         чат = сообщение.get("chat") or {}
-        от = (сообщение.get("from") or {}).get("id")
+        отправитель = сообщение.get("from") or {}
+        if not isinstance(чат, dict) or not isinstance(отправитель, dict):
+            self._записать(кто="?", вид="update неверного типа")
+            return
+        от = отправитель.get("id")
         if чат.get("type") != "private":
             self._записать(кто="группа", вид="покинута")
             try:
                 await self.api.leaveChat(чат.get("id"))
-            except (ОшибкаTelegram, httpx.HTTPError):
-                pass
+            except ОшибкаTelegram as exc:
+                # Для неподдерживаемой группы только per-update 400/403 терминальны.
+                # Общие ошибки токена/API и временные отказы оставляют update для повтора.
+                if последовательно and exc.код not in (400, 403):
+                    raise
+            except httpx.HTTPError:
+                if последовательно:
+                    raise
             return
         if self.владелец is None:
             self._записать(кто="?", вид="владелец не задан")
             return
         if от != self.владелец:
-            await self._чужой(чат.get("id"), от)
+            await self._чужой(чат.get("id"), от, последовательно)
             return
         текст = сообщение.get("text")
+        if not isinstance(текст, str):
+            текст = None
+        if not isinstance(чат.get("id"), int) or isinstance(чат.get("id"), bool):
+            self._записать(кто="владелец", вид="update неверного типа")
+            return
         команда = (текст or "").partition(" ")[0].split("@")[0].lower()
-        if команда in СРАЗУ:
-            await self._ответить(чат["id"], текст)      # справка и статус — сразу, не за длинным ответом
+        if последовательно or команда in СРАЗУ:
+            if последовательно:
+                self._в_работе[чат["id"]] += 1
+            try:
+                await self._ответить(чат["id"], текст)
+            finally:
+                if последовательно:
+                    self._в_работе[чат["id"]] -= 1
             return
         await self._в_очередь(чат["id"], текст)
 
-    async def _чужой(self, чат: int, от: Any) -> None:
+    async def _чужой(self, чат: int, от: Any, последовательно: bool = False) -> None:
         чей = _хэш(от)
         сейчас = self.часы()
         if сейчас - self._чужие.get(чей, -ЧУЖОМУ_РАЗ_В_С) >= ЧУЖОМУ_РАЗ_В_С:
-            self._чужие[чей] = сейчас
             self._записать(кто="чужой", чей=чей, вид="отказ")
             try:
                 await self.api.sendMessage(чат, "Это частный бот.")
-            except (ОшибкаTelegram, httpx.HTTPError):
-                pass
+            except ОшибкаTelegram as exc:
+                # Чужой update не даёт доступа к модели. Только per-update 400/403 у
+                # courtesy-сообщения терминальны; прочие отказы требуют повтора.
+                if последовательно and exc.код not in (400, 403):
+                    raise
+            except httpx.HTTPError:
+                if последовательно:
+                    raise
+            else:
+                self._чужие[чей] = сейчас
         else:
             self._записать(кто="чужой", чей=чей, вид="тишина")
 
@@ -800,15 +853,65 @@ class Бот:
 
     # --- опрос (D-T03) --------------------------------------------------------------------
 
+    def _состояние_offset(self) -> tuple[int | None, int | None]:
+        основной = os.path.join(self.каталог, OFFSET)
+        pending = os.path.join(self.каталог, OFFSET_ПРЕДЫДУЩИЙ)
+
+        def прочитать(путь: str) -> str | None:
+            try:
+                with open(путь, encoding="ascii") as f:
+                    return f.read().strip()
+            except FileNotFoundError:
+                return None
+            except UnicodeError as exc:
+                raise ОшибкаCheckpoint("checkpoint повреждён") from exc
+            except OSError as exc:
+                raise ОшибкаCheckpoint(f"не удалось прочитать checkpoint: {type(exc).__name__}") from exc
+
+        переход = прочитать(pending)
+        значение = прочитать(основной)
+        if переход is not None:
+            части = переход.split()
+            if (len(части) != 3 or части[0] != "v1" or
+                    части[1] != "none" and not части[1].isdigit() or not части[2].isdigit()):
+                raise ОшибкаCheckpoint("pending checkpoint повреждён")
+            старый = None if части[1] == "none" else int(части[1])
+            новый = int(части[2])
+            if старый is not None and новый <= старый:
+                raise ОшибкаCheckpoint("pending checkpoint не монотонен")
+            допустимые = ({str(старый)} if старый is not None else {None}) | {str(новый)}
+            if значение not in допустимые:
+                raise ОшибкаCheckpoint("checkpoint не соответствует pending переходу")
+            return старый, новый
+        if значение is None:
+            return None, None
+        if not значение.isascii() or not значение.isdigit():
+            raise ОшибкаCheckpoint("checkpoint повреждён")
+        return int(значение), None
+
     def _offset(self) -> int | None:
-        try:
-            with open(os.path.join(self.каталог, OFFSET), encoding="utf-8") as f:
-                return int(f.read().strip())
-        except (OSError, ValueError):
-            return None
+        return self._состояние_offset()[0]
 
     def _сохранить_offset(self, offset: int) -> None:
-        _записать_атомарно(os.path.join(self.каталог, OFFSET), f"{offset}\n")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ОшибкаCheckpoint("неверный offset")
+        основной = os.path.join(self.каталог, OFFSET)
+        pending = os.path.join(self.каталог, OFFSET_ПРЕДЫДУЩИЙ)
+        предыдущий, незавершённый = self._состояние_offset()
+        if незавершённый is not None:
+            if offset != незавершённый:
+                raise ОшибкаCheckpoint("offset не соответствует незавершённому переходу")
+        elif предыдущий is not None and offset <= предыдущий:
+            raise ОшибкаCheckpoint("offset должен расти")
+        try:
+            if незавершённый is None:
+                старый = "none" if предыдущий is None else str(предыдущий)
+                _записать_атомарно(pending, f"v1 {старый} {offset}\n")
+            _записать_атомарно(основной, f"{offset}\n")
+            os.unlink(pending)
+            _синхронизировать_каталог(self.каталог)
+        except OSError as exc:
+            raise ОшибкаCheckpoint(f"не удалось сохранить checkpoint: {type(exc).__name__}") from exc
 
     async def познакомиться(self) -> dict:
         я = await self.api.getMe()
@@ -868,15 +971,32 @@ class Бот:
         raise asyncio.CancelledError
 
     async def опросить_раз(self) -> int:
-        """Один цикл getUpdates: обновления — в работу, offset — на диск, состояние — для /admin."""
+        """Обработать пакет строго по update_id; checkpoint следует за окончательной доставкой."""
         offset = self._offset()
         обновления = await self.api.getUpdates(offset)
         self.опросов += 1
         self.ошибок_сети_подряд = 0
         self.последний_опрос = time.strftime("%Y-%m-%dT%H:%M:%S")
+        проверенные: list[tuple[int, dict]] = []
         for о in обновления:
-            self._сохранить_offset(int(о["update_id"]) + 1)
-            await self.обработать(о)
+            if not isinstance(о, dict):
+                raise ОшибкаTelegram(502, "элемент getUpdates неверного типа")
+            номер = о.get("update_id")
+            if not isinstance(номер, int) or isinstance(номер, bool) or номер < 0:
+                raise ОшибкаTelegram(502, "update_id неверного типа")
+            проверенные.append((номер, о))
+        последний: int | None = None
+        for номер, о in sorted(проверенные, key=lambda пара: пара[0]):
+            if (offset is not None and номер < offset) or номер == последний:
+                continue
+            история = {чат: list(сообщения) for чат, сообщения in self._история.items()}
+            try:
+                await self._обработать_до_конца(о)
+                self._сохранить_offset(номер + 1)
+            except BaseException:
+                self._история = история
+                raise
+            offset, последний = номер + 1, номер
         self.записать_состояние()
         return len(обновления)
 
@@ -1012,8 +1132,31 @@ def _собрать_документы(д: dict, ожидание: float, все
     return итог, dict(скрыто)
 
 
+def _синхронизировать_каталог(каталог: str) -> None:
+    fd = os.open(каталог or ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _записать_атомарно(путь: str, текст: str) -> None:
-    временный = путь + ".tmp"
-    with open(временный, "w", encoding="utf-8") as f:
-        f.write(текст)
-    os.replace(временный, путь)
+    """Долговечная атомарная замена: уникальный файл, fsync файла, rename и fsync каталога."""
+    каталог = os.path.dirname(путь) or "."
+    временный = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=каталог,
+                                         prefix="." + os.path.basename(путь) + ".", delete=False) as f:
+            временный = f.name
+            f.write(текст)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(временный, путь)
+        временный = ""
+        _синхронизировать_каталог(каталог)
+    finally:
+        if временный:
+            try:
+                os.unlink(временный)
+            except FileNotFoundError:
+                pass
