@@ -350,3 +350,116 @@ class НадёжныйOffset(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TelegramХранит(API):
+    """Как настоящий Telegram: неподтверждённые updates хранятся и отдаются, пока offset их не превысит."""
+
+    def __init__(self, обновления) -> None:
+        super().__init__()
+        self.все = list(обновления)
+        self.ошибка_бокового: Exception | None = None
+
+    async def getUpdates(self, offset, timeout=telegram.ОПРОС_С):
+        self.offsets.append(offset)
+        if timeout == 0 and self.ошибка_бокового:
+            raise self.ошибка_бокового
+        return [о for о in self.все if offset is None or о["update_id"] >= offset]
+
+
+class МгновенныеКоманды(unittest.IsolatedAsyncioTestCase):
+    """Ручная проверка владельца: /status ждал 7 минут за длинным /doc. Решение владельца
+    (2026-10-12): мгновенные команды — сразу, а durable offset Codex сохраняется."""
+
+    def setUp(self):
+        self.каталог = tempfile.mkdtemp(prefix="telegram-instant-")
+        self.addCleanup(shutil.rmtree, self.каталог, True)
+
+    def бот(self, api, сервис) -> telegram.Бот:
+        async def без_паузы(_):
+            return None
+        бот = telegram.Бот(api, сервис, ВЛАДЕЛЕЦ, self.каталог, пауза=без_паузы, правка_с=0)
+        бот.опрос_во_время_с = 0.01
+        бот.сервис.здоровье = self._здоровье
+        return бот
+
+    async def _здоровье(self):
+        return {"status": "ok", "model": "test-model", "queue": {"идёт": 1, "ждут": 0, "мест_в_очереди": 4,
+                                                                 "средняя_с": 20.0}}
+
+    def offset(self) -> str | None:
+        путь = pathlib.Path(self.каталог, telegram.OFFSET)
+        return путь.read_text(encoding="ascii").strip() if путь.exists() else None
+
+    async def ждать(self, условие, секунд: float = 2.0):
+        конец = asyncio.get_running_loop().time() + секунд
+        while not условие():
+            if asyncio.get_running_loop().time() > конец:
+                self.fail("не дождался условия")
+            await asyncio.sleep(0.01)
+
+    @staticmethod
+    def статусы(api) -> list[str]:
+        return [т for т in api.отправлено if т.startswith("Сервис:")]
+
+    async def test_status_во_время_долгого_ответа_и_offset_по_префиксу(self):
+        ворота = asyncio.Event()
+        api, сервис = TelegramХранит([обновление(10, "долгий вопрос"), обновление(11, "/status")]), Сервис(ворота)
+        бот = self.бот(api, сервис)
+        задача = asyncio.create_task(бот.опросить_раз())
+        await asyncio.wait_for(сервис.начат.wait(), 1)
+        await self.ждать(lambda: self.статусы(api))
+        self.assertFalse(задача.done(), "ответ на /status пришёл, пока модель ещё отвечает")
+        self.assertIn("бот отвечает", self.статусы(api)[0])
+        self.assertIsNone(self.offset(), "незавершённый update 10 не подтверждён")
+        ворота.set()
+        await задача
+        self.assertEqual(self.offset(), "12", "после 10 сплошной префикс включает уже отвеченный 11")
+        self.assertEqual(len(self.статусы(api)), 1, "/status не отвечен дважды")
+        self.assertEqual(сервис.вопросы, ["долгий вопрос"])
+
+    async def test_падение_не_теряет_вопрос_а_status_может_повториться(self):
+        ворота = asyncio.Event()
+        api, сервис = TelegramХранит([обновление(10, "долгий вопрос"), обновление(11, "/status")]), Сервис(ворота)
+        бот = self.бот(api, сервис)
+        задача = asyncio.create_task(бот.опросить_раз())
+        await self.ждать(lambda: self.статусы(api))
+        задача.cancel()                       # SIGTERM посреди генерации
+        with self.assertRaises(asyncio.CancelledError):
+            await задача
+        self.assertIsNone(self.offset())
+        сервис2 = Сервис()
+        бот2 = self.бот(api, сервис2)
+        await бот2.опросить_раз()
+        self.assertEqual(сервис2.вопросы, ["долгий вопрос"], "вопрос 10 не потерян")
+        self.assertEqual(self.offset(), "12")
+        self.assertEqual(len(self.статусы(api)), 2, "после аварии /status допустимо повторить")
+
+    async def test_сбой_бокового_опроса_не_ломает_ответ(self):
+        ворота = asyncio.Event()
+        api, сервис = TelegramХранит([обновление(10, "долгий вопрос")]), Сервис(ворота)
+        api.ошибка_бокового = httpx.ConnectError("сеть")
+        бот = self.бот(api, сервис)
+        задача = asyncio.create_task(бот.опросить_раз())
+        await asyncio.wait_for(сервис.начат.wait(), 1)
+        await self.ждать(lambda: api.offsets.count(10) >= 2)
+        ворота.set()
+        await задача
+        self.assertEqual(self.offset(), "11")
+
+    async def test_вне_очереди_только_команды_владельца(self):
+        ворота = asyncio.Event()
+        api = TelegramХранит([обновление(10, "долгий вопрос"), обновление(11, "второй вопрос"),
+                              обновление(12, "/status", отправитель=7002)])
+        сервис = Сервис(ворота)
+        бот = self.бот(api, сервис)
+        задача = asyncio.create_task(бот.опросить_раз())
+        await asyncio.wait_for(сервис.начат.wait(), 1)
+        await self.ждать(lambda: api.offsets.count(10) >= 3)
+        self.assertEqual(сервис.вопросы, ["долгий вопрос"], "второй вопрос ждёт своей очереди")
+        self.assertNotIn("Это частный бот.", api.отправлено, "чужой — в порядке очереди, не вне её")
+        ворота.set()
+        await задача
+        self.assertEqual(сервис.вопросы, ["долгий вопрос", "второй вопрос"])
+        self.assertIn("Это частный бот.", api.отправлено)
+        self.assertEqual(self.offset(), "13")

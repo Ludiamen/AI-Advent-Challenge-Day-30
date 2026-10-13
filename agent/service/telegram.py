@@ -48,6 +48,7 @@ API_TELEGRAM = "https://api.telegram.org"
 ОПРОС_МЕСТА_С = 5.0          # queue_full: раз в N с смотреть /health — не освободилось ли место
 ДЛИНА = 4000                 # предел Telegram — 4096 символов на сообщение
 ОПРОС_С = 25                 # ожидание getUpdates (A-T1)
+ОПРОС_ВО_ВРЕМЯ_ОТВЕТА_С = 2.0  # пока модель отвечает — короткий getUpdates: не ждут ли /status, /help, /start
 ЧУЖОМУ_РАЗ_В_С = 86400.0     # «это частный бот» — не чаще раза в сутки на человека
 ЖУРНАЛ = "telegram.jsonl"
 # Белый список журнала бота: текстов и ID владельца в нём нет и быть не может.
@@ -552,6 +553,10 @@ class Бот:
         self.ошибок_сети_подряд = 0
         self.последняя_ошибка = ""
         self.последний_опрос = ""
+        # Мгновенные команды, отвеченные вне очереди: offset дойдёт до них по порядку и только
+        # подтвердит. В памяти — после аварии команда может прийти повторно (безвредно).
+        self.опрос_во_время_с = ОПРОС_ВО_ВРЕМЯ_ОТВЕТА_С
+        self._отвечено_вне_очереди: set[int] = set()
 
     # --- кто пишет --------------------------------------------------------------------
 
@@ -989,9 +994,15 @@ class Бот:
         for номер, о in sorted(проверенные, key=lambda пара: пара[0]):
             if (offset is not None and номер < offset) or номер == последний:
                 continue
+            if номер in self._отвечено_вне_очереди:
+                # Уже отвечено, пока шла генерация: только сдвинуть сплошной префикс.
+                self._сохранить_offset(номер + 1)
+                self._отвечено_вне_очереди.discard(номер)
+                offset, последний = номер + 1, номер
+                continue
             история = {чат: list(сообщения) for чат, сообщения in self._история.items()}
             try:
-                await self._обработать_до_конца(о)
+                await self._с_боковым_опросом(номер, self._обработать_до_конца(о))
                 self._сохранить_offset(номер + 1)
             except BaseException:
                 self._история = история
@@ -999,6 +1010,52 @@ class Бот:
             offset, последний = номер + 1, номер
         self.записать_состояние()
         return len(обновления)
+
+    def _мгновенная(self, о: Any) -> bool:
+        """/status, /help, /start владельца в личном чате — ответ без модели, его можно дать вне очереди."""
+        сообщение = о.get("message") if isinstance(о, dict) else None
+        if not isinstance(сообщение, dict):
+            return False
+        чат, от, текст = сообщение.get("chat"), (сообщение.get("from") or {}), сообщение.get("text")
+        if (not isinstance(чат, dict) or чат.get("type") != "private" or not isinstance(от, dict) or
+                self.владелец is None or от.get("id") != self.владелец or not isinstance(текст, str)):
+            return False
+        return текст.partition(" ")[0].split("@")[0].lower() in СРАЗУ
+
+    async def _с_боковым_опросом(self, номер: int, работа: Awaitable[None]) -> None:
+        """Выполнить update; пока он идёт, раз в опрос_во_время_с отвечать на мгновенные команды.
+
+        Основной цикл ждёт окончательной доставки (durable offset), поэтому новых getUpdates
+        во время генерации нет — и /status ждал минутами (ручная проверка владельца). Боковой
+        getUpdates с offset = номер ничего не подтверждает сверх уже подтверждённого: Telegram
+        хранит текущий и последующие updates, пока checkpoint до них не дойдёт."""
+        задача = asyncio.ensure_future(работа)
+        try:
+            while True:
+                готово, _ = await asyncio.wait({задача}, timeout=self.опрос_во_время_с)
+                if готово:
+                    return задача.result()
+                await self._ответить_вне_очереди(номер)
+        finally:
+            if not задача.done():
+                задача.cancel()
+                await asyncio.gather(задача, return_exceptions=True)
+
+    async def _ответить_вне_очереди(self, номер: int) -> None:
+        try:
+            свежие = await self.api.getUpdates(номер, timeout=0)
+        except (ОшибкаTelegram, httpx.HTTPError):
+            return                                # боковой опрос — по возможности; ошибки разберёт основной
+        for о in свежие if isinstance(свежие, list) else []:
+            n = о.get("update_id") if isinstance(о, dict) else None
+            if (not isinstance(n, int) or isinstance(n, bool) or n <= номер or
+                    n in self._отвечено_вне_очереди or not self._мгновенная(о)):
+                continue
+            try:
+                await self._обработать_до_конца(о)
+            except (ОшибкаTelegram, httpx.HTTPError):
+                continue                          # не доставлено — ответит основной цикл по порядку
+            self._отвечено_вне_очереди.add(n)
 
     async def опрашивать(self, стоп: asyncio.Event) -> None:
         """Опрос до остановки. Сеть/5xx/429 повторяются; остальные 4xx завершают процесс."""

@@ -101,7 +101,9 @@ else:
                 cwd=Path(__file__).resolve().parent,
                 capture_output=True,
                 text=True,
-                timeout=2,
+                # Предел ловит вечное зависание на open() FIFO. 2 с было мало: один импорт
+                # agent.service.journal на нагруженном ноутбуке — около 2 с (тест падал случайно).
+                timeout=30,
                 check=False,
             )
 
