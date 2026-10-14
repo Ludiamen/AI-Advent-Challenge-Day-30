@@ -1605,10 +1605,28 @@ if (РЕЖИМ === 'телеграм') {
   };
   const чатБота = () => выполнить(`(() => { const з = document.querySelector('.chat-info .peer-title');
     return !!з && з.textContent === ${JSON.stringify(БОТ)} && !!document.querySelector('.input-message-input[contenteditable]'); })()`);
-  const входящих = () => выполнить(`document.querySelectorAll('.bubble.is-in').length`);
-  const последнийВходящий = () => выполнить(`(() => { const м = [...document.querySelectorAll('.bubble.is-in .message')];
-    return м.length ? м[м.length - 1].innerText : ''; })()`);
+  // Новые сообщения бота — по номеру (data-mid растёт), а не по числу пузырей: Telegram Web
+  // выгружает невидимые старые пузыри, число падает, и показ ждал ответ, который уже пришёл.
+  const входящих = () => выполнить(`Math.max(0, ...[...document.querySelectorAll('.bubble.is-in')]
+    .map(б => Number(б.dataset.mid) || 0))`);
+  // Тексты сообщений бота, появившихся после «было»: ответ ищется среди всех новых — во время
+  // ответа /doc приходит и ответ на /status (версия 7), и последний пузырь уже не тот.
+  const входящиеПосле = (было) => выполнить(`[...document.querySelectorAll('.bubble.is-in')]
+    .filter(б => (Number(б.dataset.mid) || 0) > ${Number(было) || 0})
+    .map(б => (б.querySelector('.message') || {}).innerText || '')`);
+  const скрытьСписок = () => выполнить(`(() => {
+    if (!document.getElementById('показ-без-списка')) {
+      const с = document.createElement('style');
+      с.id = 'показ-без-списка';
+      с.textContent = '#column-left { display: none !important; }';
+      document.head.appendChild(с);
+    }
+    return 1; })()`);
+  const списокСкрыт = () => выполнить(`(() => { const л = document.getElementById('column-left');
+    return !л || getComputedStyle(л).display === 'none' || л.getBoundingClientRect().width === 0; })()`);
   const отправить = async (текст) => {
+    await скрытьСписок();
+    if (!(await списокСкрыт())) throw new Error('список чатов виден — отправка отменена');
     должно(await ждатьНаСтранице(`(() => { const з = document.querySelector('.chat-info .peer-title');
       return !!з && з.textContent === ${JSON.stringify(БОТ)}; })()`, 30000), 'открыт не чат с ботом — отправка отменена');
     if (!(await чатБота())) throw new Error('открыт не чат с ботом');
@@ -1626,9 +1644,11 @@ if (РЕЖИМ === 'телеграм') {
     let прошлый = 0;
     while (Date.now() - начало < мс) {
       await подождать(1000);
-      if ((await входящих()) <= было) continue;
-      const т = await последнийВходящий();
-      if (т.includes(признак)) return т;
+      const новые = await входящиеПосле(было) || [];
+      if (!новые.length) continue;
+      const найден = новые.find(т_ => т_.includes(признак));
+      if (найден) return найден;
+      const т = новые[0];
       if (Date.now() - прошлый > 4000) {
         прошлый = Date.now();
         await подпись(сцена, т.startsWith('⏳') ? `${что}: ${т.split('\n')[0].replace('⏳ ', '')} (${Math.round((Date.now() - начало) / 1000)} с)`
@@ -1640,6 +1660,18 @@ if (РЕЖИМ === 'телеграм') {
   const подписьОтвета = т => (т.split('\n').find(с => с.startsWith('— loc-rag-docs')) || '').replace(/\d{1,2}:\d{2}$/, '').trim();
 
   должно(await ждатьНаСтранице(`!!document.querySelector('.chat-info .peer-title')`, 60000), 'Telegram Web не открыл чат с ботом');
+  // Список чатов владельца в кадр не попадает: пока Telegram Web загружается, он показывает две
+  // колонки, и в первой записи бота в кадре были имена и превью личных переписок. Левая колонка
+  // скрывается стилем, а запись начинается только после подтверждения (файл READY → RECORDING).
+  await скрытьСписок();
+  должно(await списокСкрыт(), 'список чатов не скрыт — запись не начинается');
+  if (!(await списокСкрыт())) { console.log('\n=== итог показа ===\nРАСХОЖДЕНИЯ:\n  список чатов не скрыт'); process.exit(0); }
+  if (process.env.READY) {
+    const fs = await import('node:fs');
+    fs.writeFileSync(process.env.READY, '1');
+    const конецОжидания = Date.now() + 60000;
+    while (process.env.RECORDING && !fs.existsSync(process.env.RECORDING) && Date.now() < конецОжидания) await подождать(200);
+  }
 
   // --- сцена 1 ---------------------------------------------------------------------
   // История живого бота — в памяти его процесса: прерванный дубль оставил свои реплики, и вопрос
@@ -1679,6 +1711,16 @@ if (РЕЖИМ === 'телеграм') {
   await подпись('Сцена 4', '/doc — ответ по документам организации: поиск и модель на этой машине, в Telegram — ответ, источник и цитата');
   начало = Date.now();
   было = await отправить('/doc До какого числа нужно оплачивать услуги связи по договору VPN с Ростелекомом?');
+  // Пока модель отвечает — /status (ручная проверка владельца: ждал 7 минут; версия 7 — сразу).
+  await ждатьНаСтранице(`[...document.querySelectorAll('.bubble.is-in')].some(б => (Number(б.dataset.mid) || 0) > ${Number(было) || 0})`, 120000);
+  await подождать(ПАУЗА);
+  const былоСтатус = await входящих();
+  const началоСтатуса = Date.now();
+  await отправить('/status');
+  const статус = await ответБота(былоСтатус, 'Сервис:', 'Сцена 4', '/status', 60000);
+  const секундСтатуса = Math.round((Date.now() - началоСтатуса) / 1000);
+  должно(/бот отвечает/.test(статус) && секундСтатуса <= 30, `сцена 4: /status во время ответа — ${секундСтатуса} с, без «бот отвечает»`);
+  await подпись('Сцена 4', `/status, пока модель ищет ответ по документам, — ответ за ${секундСтатуса} с: «Сейчас бот отвечает на предыдущее сообщение» (ручная проверка: раньше ждал 7 минут)`);
   const о4 = await ответБота(было, 'по документам · вход', 'Сцена 4', 'документы');
   метки.push({начало, конец: Date.now(), что: 'документы'});
   должно(/20 числа/.test(о4) && /✓/.test(о4), 'сцена 4: нет «20 числа» с подтверждённой цитатой');

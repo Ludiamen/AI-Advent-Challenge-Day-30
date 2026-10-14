@@ -14657,6 +14657,31 @@ class БотTelegram(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.tg.тексты()[-1].startswith("Москва"))
         await бот.закрыть()
 
+    async def test_queue_full_медленный_health_не_растягивает_ожидание(self):
+        # check_cli (шаг 30.10): под нагрузкой /health отвечает секундами, а предел считался только
+        # по сумме пауз — повтор уходил позже Retry-After. Теперь предел — и по реальным часам.
+        часы = [0.0]
+        self.сервис.чат += [_отказ(429, "queue_full", 10), _sse("ок")]
+        self.сервис.очереди = [{"идёт": 1, "ждут": 4}] * 5
+        api = svc_tg.BotAPI("123:TESTTOKEN", база="http://127.0.0.1:18080", transport=httpx.MockTransport(self.tg))
+        сервис = svc_tg.КлиентСервиса("https://svc.test", "sk-day30-test", transport=httpx.MockTransport(self.сервис))
+        здоровье = сервис.здоровье
+
+        async def медленное_здоровье():
+            часы[0] += 4.0
+            return await здоровье()
+        сервис.здоровье = медленное_здоровье
+
+        async def пауза(секунд):
+            self.паузы.append(секунд)
+            часы[0] += секунд
+        бот = svc_tg.Бот(api, сервис, владелец=self.ВЛАДЕЛЕЦ, каталог=self.каталог, пауза=пауза, правка_с=0.0,
+                         часы=lambda: часы[0])
+        await self.прогон(бот, "вопрос")
+        self.assertEqual(self.паузы, [5.0, 1.0], "5 с, /health (+4 с), остаток до 10 с — 1 с, повтор")
+        self.assertTrue(any("попытка 2" in т for т in self.tg.тексты()), "номер попытки виден")
+        await бот.закрыть()
+
     async def test_queue_full_не_дольше_retry_after(self):
         self.сервис.чат += [_отказ(429, "queue_full", 12), _sse("ок")]
         self.сервис.очереди = [{"идёт": 1, "ждут": 4}] * 10
@@ -15007,6 +15032,10 @@ class ПоказTelegram(unittest.TestCase):
             self.assertIn(f"| {номер} |", self.сценарий)
         self.assertNotIn("'Сцена 7'", self.блок)
         self.assertIn("открыт не чат с ботом", self.блок, "перед отправкой — сверка заголовка чата")
+        self.assertIn("await отправить('/status')", self.блок, "сцена 4 показывает мгновенный /status (версия 7)")
+        # Список чатов владельца в кадр не попадает: колонка скрыта до записи и перед каждой отправкой.
+        self.assertIn("#column-left { display: none !important; }", self.блок)
+        self.assertIn("process.env.READY", self.блок)
         for селектор in (".chat-info .peer-title", ".input-message-input[contenteditable]", ".bubble.is-in"):
             self.assertIn(селектор, self.блок)
         self.assertIn("process.exit(0)", self.блок)
@@ -15025,6 +15054,9 @@ class ПоказTelegram(unittest.TestCase):
             self.assertIn(кусок, self.скрипт)
         self.assertNotIn('rm -rf "$PROFILE"', self.скрипт, "профиль с сеансом удаляет владелец, не скрипт")
         self.assertIn("CDP_TIMEOUT=60000", self.скрипт, "подвисшая страница не вешает показ")
+        self.assertIn('["exit_type"] = "Normal"', self.скрипт, "нет окна «Восстановить страницы?» поверх чата")
+        self.assertLess(self.скрипт.index('READY="$SCRATCH/ready"'), self.скрипт.index('record_demo.sh" --name телеграм'),
+                        "запись — только после того, как чат открыт и список чатов скрыт")
         водитель = pathlib.Path(os.path.dirname(os.path.abspath(__file__)), "browser.mjs").read_text(encoding="utf-8")
         self.assertIn("process.env.CDP_TIMEOUT", водитель)
 

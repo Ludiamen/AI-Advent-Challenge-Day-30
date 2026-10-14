@@ -60,6 +60,10 @@ except (OSError, ValueError):
     данные = {}
 данные["credentials_enable_service"] = False
 данные.setdefault("profile", {})["password_manager_enabled"] = False
+# Прошлый Chrome мог быть погашен сигналом: без этого он весь показ держит окно «Восстановить
+# страницы?» поверх чата (седьмая запись бота — 121 кадр из 122).
+данные["profile"]["exit_type"] = "Normal"
+данные["profile"]["exited_cleanly"] = True
 json.dump(данные, open(путь, "w", encoding="utf-8"))
 PYCODE
 
@@ -113,7 +117,7 @@ google-chrome --new-window \
   --remote-debugging-port="$DEBUG_PORT" \
   --user-data-dir="$PROFILE" \
   --ignore-certificate-errors-spki-list="$SPKI" \
-  --no-first-run --no-default-browser-check \
+  --no-first-run --no-default-browser-check --hide-crash-restore-bubble \
   --window-size=880,980 --window-position=40,40 \
   "about:blank" > "$SCRATCH/chrome.log" 2>&1 &
 CHROME_PID=$!
@@ -124,21 +128,37 @@ done
 curl -s -o /dev/null "http://127.0.0.1:$DEBUG_PORT/json/version" || { echo "Chrome не отдал порт отладки"; exit 1; }
 sleep 2
 
+# Водитель сначала открывает чат с ботом и скрывает список чатов владельца (файл READY), и
+# только потом начинается запись (файл RECORDING): в первой записи бота список чатов — имена
+# и превью личных переписок — попал в кадр, пока Telegram Web загружался.
+echo "3/5 Открываю чат с ботом и скрываю список чатов (до записи)…"
+# CDP_TIMEOUT: вызовы показа короткие — подвисшая под нагрузкой страница не должна вешать показ.
+CDP="http://127.0.0.1:$DEBUG_PORT" PAUSE="$PAUSE" MARKS="$SCRATCH/marks.json" SERVICE_KEYS="$SCRATCH/keys.json" \
+  ADMIN_URL="$URL/admin" BOT_TITLE="$BOT_TITLE" CDP_TIMEOUT=60000 \
+  READY="$SCRATCH/ready" RECORDING="$SCRATCH/recording" \
+  node "$ROOT/browser.mjs" "https://web.telegram.org/k/#@$BOT_USERNAME" ds-flash "" телеграм &
+DRIVER_PID=$!
+for _ in $(seq 1 300); do
+  [ -f "$SCRATCH/ready" ] && break
+  kill -0 "$DRIVER_PID" 2>/dev/null || break
+  sleep 0.2
+done
+if [ ! -f "$SCRATCH/ready" ]; then
+  echo "Чат с ботом не открылся или список чатов не скрыт — запись не начата."
+  wait "$DRIVER_PID"; exit 1
+fi
 if [ "$RECORD" = 1 ]; then
-  echo "3/5 Запись экрана…"
+  echo "   запись экрана…"
   REC_START_MS="$(date +%s%3N)"
   bash "$ROOT/record_demo.sh" --name телеграм --pid "$CHROME_PID" > "$SCRATCH/запись.log" 2>&1 &
   REC_PID=$!
   sleep 2
 else
-  echo "3/5 Запись выключена ключом --no-record"
+  echo "   запись выключена ключом --no-record"
 fi
-
+touch "$SCRATCH/recording"
 echo "4/5 Прохожу шесть сцен (10–20 минут: модель на CPU отвечает по-настоящему)…"
-# CDP_TIMEOUT: вызовы показа короткие — подвисшая под нагрузкой страница не должна вешать показ.
-CDP="http://127.0.0.1:$DEBUG_PORT" PAUSE="$PAUSE" MARKS="$SCRATCH/marks.json" SERVICE_KEYS="$SCRATCH/keys.json" \
-  ADMIN_URL="$URL/admin" BOT_TITLE="$BOT_TITLE" CDP_TIMEOUT=60000 \
-  node "$ROOT/browser.mjs" "https://web.telegram.org/k/#@$BOT_USERNAME" ds-flash "" телеграм
+wait "$DRIVER_PID"
 SHOW_CODE=$?
 
 if [ "$RECORD" = 1 ]; then

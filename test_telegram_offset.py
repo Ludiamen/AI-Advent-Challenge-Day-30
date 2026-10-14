@@ -411,6 +411,7 @@ class МгновенныеКоманды(unittest.IsolatedAsyncioTestCase):
         await self.ждать(lambda: self.статусы(api))
         self.assertFalse(задача.done(), "ответ на /status пришёл, пока модель ещё отвечает")
         self.assertIn("бот отвечает", self.статусы(api)[0])
+        self.assertNotIn("ждут ещё", self.статусы(api)[0], "/status не считает занятым сам себя (видео, сцена 4)")
         self.assertIsNone(self.offset(), "незавершённый update 10 не подтверждён")
         ворота.set()
         await задача
